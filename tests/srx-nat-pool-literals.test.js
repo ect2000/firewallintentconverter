@@ -6,9 +6,42 @@
 
 import { describe, it, expect } from 'vitest';
 import { convertToSrxSetCommands } from '../src/converters/srx-converter.js';
+import { buildSrxXml } from '../src/converters/srx-xml-builder.js';
 import { validateSetOutput } from '../src/security/junos-output-validation.js';
 
 describe('NAT Pool Literal Addresses (Issue #35)', () => {
+  it.each([
+    ['source', { src_addresses: ['ghost', '192.0.2.0/24'] }, 'not a known address object'],
+    ['source', { src_addresses: ['fqdn', '192.0.2.0/24'] }, 'resolves to FQDN'],
+    ['source', { translated_src: { type: 'static', address: 'ghost' } }, 'fell back to interface NAT'],
+    ['source', { translated_src: { type: 'dynamic-ip-pool', addresses: ['ghost'] } }, 'not a known address object'],
+    ['destination', { translated_dst: { address: 'ghost' } }, 'Destination NAT rule'],
+    ['static', { translated_src: { address: 'ghost' } }, 'Static NAT rule'],
+  ])('reports usable %s NAT warnings for %j', (type, overrides, message) => {
+    const config = {
+      zones: [{ name: 'trust' }, { name: 'untrust' }],
+      address_objects: [{ name: 'fqdn', value: 'host.example.invalid' }],
+      nat_rules: [{
+        name: 'warning-case', type, enabled: true,
+        src_zones: ['trust'], dst_zones: ['untrust'],
+        src_addresses: ['192.0.2.0/24'], dst_addresses: ['203.0.113.10'],
+        ...overrides,
+      }],
+    };
+    for (const result of [convertToSrxSetCommands(config), buildSrxXml(config)]) {
+      const natWarnings = result.warnings.filter(w => w.element?.startsWith('nat/'));
+      expect(natWarnings.length).toBeGreaterThan(0);
+      expect(natWarnings.some(w => w.message?.includes(message))).toBe(true);
+      for (const warning of natWarnings) {
+        expect(warning.severity).toBe('warning');
+        expect(warning.element).toBe(`nat/${type}/warning-case`);
+        expect(typeof warning.message).toBe('string');
+        expect(warning.message.length).toBeGreaterThan(0);
+        expect(typeof warning.suggestion).toBe('string');
+      }
+    }
+  });
+
   describe('Static Source NAT', () => {
     it('should fall back to interface NAT when translated address is undefined', () => {
       const config = {
@@ -49,7 +82,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
 
       // Must have a warning
       expect(result.warnings.some(w =>
-        w.severity === 'nat' && w.element.includes('UNDEFINED-POOL-OBJ')
+        w.severity === 'warning' && w.message?.includes('UNDEFINED-POOL-OBJ')
       )).toBe(true);
     });
 
@@ -89,7 +122,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
       expect(natCommands.some(c => c.match(/then source-nat pool \S+/))).toBe(true);
 
       // No warnings for this resolved case
-      expect(result.warnings.filter(w => w.severity === 'nat')).toHaveLength(0);
+      expect(result.warnings.filter(w => w.element?.startsWith('nat/'))).toHaveLength(0);
     });
 
     it('should preserve prefix notation when translated address has a prefix', () => {
@@ -202,7 +235,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
 
       // Must have a warning
       expect(result.warnings.some(w =>
-        w.severity === 'nat' && w.element.includes('GHOST-SERVER')
+        w.severity === 'warning' && w.message?.includes('GHOST-SERVER')
       )).toBe(true);
 
       // Fix 1: The full output must pass validateSetOutput (no match-without-then)
@@ -244,7 +277,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
       expect(natCommands.some(c => c.includes('then destination-nat pool'))).toBe(true);
 
       // No warnings for this resolved case
-      expect(result.warnings.filter(w => w.severity === 'nat')).toHaveLength(0);
+      expect(result.warnings.filter(w => w.element?.startsWith('nat/'))).toHaveLength(0);
     });
 
     it('should handle destination NAT with port translation', () => {

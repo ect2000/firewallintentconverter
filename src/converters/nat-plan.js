@@ -168,35 +168,39 @@ export function planNat({
   const groupNames = new Set((addressGroups || []).map(group => group.name));
 
   // Junos NAT match/pool addresses must be IPs, not address-book names.
-  const resolveNatAddress = addr => {
+  const resolveNatAddress = (addr, element) => {
     if (!addr || addr === 'any') return null;
     if (isLiteralAddress(addr)) return addr;
     const resolved = addrLookup[addr];
     if (!resolved) {
-      warnings.push(createWarning('nat', `NAT match address "${addr}" is not a known address object — skipped`));
+      warnings.push(createWarning('warning', element,
+        `NAT match address "${addr}" is not a known address object — skipped`,
+        'Define the address as an IP/prefix object before converting NAT'));
       return null;
     }
     // Skip FQDN / dns-name values (not usable in NAT match)
     if (!/^\d+\.\d+\.\d+\.\d+/.test(resolved) && !/^[0-9a-fA-F:]+/.test(resolved)) {
-      warnings.push(createWarning('nat', `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`));
+      warnings.push(createWarning('warning', element,
+        `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`,
+        'Use an IP/prefix object for this NAT address'));
       return null;
     }
     return resolved;
   };
-  const matchAddress = (ruleIndex, field, addressIndex, rawAddress) => {
+  const matchAddress = (ruleIndex, field, addressIndex, rawAddress, element) => {
     const plannedName = naming.reference(`nat_rules[${ruleIndex}].${field}[${addressIndex}]`);
     // A defined object wins over a name that merely looks like an address.
     const literal = isLiteralAddress(rawAddress) && !rawAddressNames.has(rawAddress);
-    return resolveNatAddress(literal ? rawAddress : plannedName);
+    return resolveNatAddress(literal ? rawAddress : plannedName, element);
   };
-  const translatedAddress = rawAddress => (
-    resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress)
+  const translatedAddress = (rawAddress, element) => (
+    resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress, element)
   );
   // A "start-end" source pool range (FortiGate ippool) is Junos "A/32 to B/32".
   // A range object (ASA `range A B`) resolves to the same "A-B" form.
-  const sourcePoolAddress = rawAddress => {
+  const sourcePoolAddress = (rawAddress, element) => {
     const literal = String(rawAddress || '');
-    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress);
+    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress, element);
     if (!resolved) return null;
     const range = resolved.match(IPV4_RANGE);
     return range ? { prefix: `${range[1]}/32`, to: `${range[2]}/32` } : { prefix: withPrefix(resolved) };
@@ -294,7 +298,7 @@ export function planNat({
    * Plans one match field. A field that listed addresses but resolved none
    * must not become "match anything", so it reports `unresolved`.
    */
-  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny }) => {
+  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, element }) => {
     const addresses = rule[field];
     if (!Array.isArray(addresses)) return { entries: keepAny ? [{ kind: 'prefix', value: anyAddress }] : [], unresolved: false };
     const entries = [];
@@ -310,7 +314,7 @@ export function planNat({
         entries.push({ kind: 'address-name', value: naming.reference(referencePath) });
         succeeded += 1;
       } else {
-        const resolved = matchAddress(ruleIndex, field, addressIndex, addr);
+        const resolved = matchAddress(ruleIndex, field, addressIndex, addr, element);
         if (!resolved) continue;
         entries.push({ kind: 'prefix', value: resolved });
         succeeded += 1;
@@ -360,7 +364,7 @@ export function planNat({
     rule.caveat ? [`CAVEAT: ${oneLine(rule.caveat)}`] : []
   );
 
-  const planSourceThen = (ruleIndex, rule, comments) => {
+  const planSourceThen = (ruleIndex, rule, comments, element) => {
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
     if (!translated) return interfaceThen;
@@ -387,7 +391,7 @@ export function planNat({
     }
     if (translated.type === 'dynamic-ip-pool') {
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'source-nat-pool');
-      const addresses = (translated.addresses || []).map(sourcePoolAddress);
+      const addresses = (translated.addresses || []).map(address => sourcePoolAddress(address, element));
       if (addresses.length > 0 && addresses.every(Boolean)) {
         // A pool range the source disabled ARP replies for is left to the user's own ARP setup.
         const arpDisabled = translated.arp_reply_disabled || [];
@@ -400,13 +404,15 @@ export function planNat({
     }
     if (translated.type === 'static') {
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
-      const resolved = translatedAddress(translated.address);
+      const resolved = translatedAddress(translated.address, element);
       if (resolved) {
         if (rule.arp_reply !== false) addProxyCandidates([{ prefix: withPrefix(resolved) }], natDestinationZones(rule));
         return { kind: 'pool', pool: { name: poolName, addresses: [{ prefix: withPrefix(resolved) }] } };
       }
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
-      warnings.push(createWarning('nat', `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`));
+      warnings.push(createWarning('warning', element,
+        `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`,
+        'Resolve the translated source address or verify interface NAT manually'));
       return interfaceThen;
     }
     // Unknown translation type: default to interface NAT (e.g. Check Point hide NAT)
@@ -454,7 +460,8 @@ export function planNat({
         ruleSet.rules.push(planned);
 
         const anyAddress = natAnyAddress(rule);
-        const options = { anyAddress, allowGroups: true, keepAny: true };
+        const element = `nat/source/${name}`;
+        const options = { anyAddress, allowGroups: true, keepAny: true, element };
         const source = planMatchField(ruleIndex, rule, 'src_addresses', options);
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses', options);
         const unresolvedField = source.unresolved ? 'src_addresses' : (destination.unresolved ? 'dst_addresses' : null);
@@ -469,7 +476,7 @@ export function planNat({
           protocol: planProtocol(rule),
           destinationPort: planPort(rule),
         };
-        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments);
+        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, element);
         // U-turn/hairpin NAT: persistent-nat for return traffic
         planned.persistent = Boolean(rule._uturn);
       }
@@ -520,18 +527,20 @@ export function planNat({
           const rawDestination = typeof rule.translated_dst === 'string'
             ? rule.translated_dst : rule.translated_dst.address || '';
           if (rawDestination) {
-            resolvedDestination = translatedAddress(rawDestination);
+            resolvedDestination = translatedAddress(rawDestination, `nat/destination/${ruleName}`);
             if (!resolvedDestination) {
               planned.skipped = true;
               comments.push(`NAT: destination rule "${ruleName}" skipped — translated destination "${rawDestination}" is not a resolvable IP/prefix`);
-              warnings.push(createWarning('nat', `Destination NAT rule "${ruleName}" skipped — translated address "${rawDestination}" could not be resolved to an IP/prefix`));
+              warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
+                `Destination NAT rule "${ruleName}" skipped — translated address "${rawDestination}" could not be resolved to an IP/prefix`,
+                'Define a translated IP/prefix and add the destination NAT rule manually'));
               continue;
             }
           }
         }
 
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: true });
+          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: true, element: `nat/destination/${ruleName}` });
         if (destination.unresolved) {
           planned.skipped = true;
           comments.push(skipUnresolved('destination', ruleName, 'dst_addresses', rule));
@@ -570,7 +579,7 @@ export function planNat({
       ruleSet.rules.push(planned);
 
       const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-        { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false });
+        { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false, element: `nat/static/${ruleName}` });
       if (destination.unresolved) {
         planned.skipped = true;
         comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
@@ -578,11 +587,13 @@ export function planNat({
       }
       let prefix = null;
       if (rule.translated_src && rule.translated_src.address) {
-        prefix = translatedAddress(rule.translated_src.address);
+        prefix = translatedAddress(rule.translated_src.address, `nat/static/${ruleName}`);
         if (!prefix) {
           planned.skipped = true;
           comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
-          warnings.push(createWarning('nat', `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`));
+          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+            `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
+            'Define a translated IP/prefix and add the static NAT rule manually'));
           continue;
         }
       }
