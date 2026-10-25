@@ -1833,29 +1833,153 @@ function parseSecurityPolicies(tree, warnings) {
 function parseNatRules(tree, warnings) {
   const natRules = [];
   const ifaceToZone = {};
+  const zoneMemberCount = {};
   for (const zone of parseZones(tree, warnings)) {
+    zoneMemberCount[zone.name] = zone.interfaces.length;
     for (const iface of zone.interfaces) ifaceToZone[iface] = zone.name;
   }
   let ruleIndex = 1;
+  const zoneOf = (iface) => ifaceToZone[iface] || iface;
+  // A zone stands for an interface only when it is the zone's sole member; otherwise
+  // the zone-scoped rule-set would also translate traffic on the sibling interfaces.
+  const sharedZoneOf = (iface) => (ifaceToZone[iface] && zoneMemberCount[ifaceToZone[iface]] > 1 ? ifaceToZone[iface] : null);
+
+  // IP pools become SRX source pools only where a rule names them; an
+  // unknown or absent pool means egress-interface NAT.
+  const ippoolSection = tree['firewall ippool'] || {};
+  const warnedPools = new Set();
+  const poolTranslation = (poolNames) => {
+    const pools = poolNames.filter((poolName) => typeof ippoolSection[poolName] === 'object');
+    for (const poolName of poolNames) {
+      if (pools.includes(poolName) || warnedPools.has(poolName)) continue;
+      warnedPools.add(poolName);
+      warnings.push(createWarning('warning', `nat/ippool/${poolName}`,
+        `IP pool "${poolName}" is not defined — source NAT falls back to the egress interface address`,
+        'Define the pool or correct the pool name, then review the SRX source NAT translation'));
+    }
+    // Only the default overload pool maps to a Junos PAT pool; make other modes loud.
+    for (const poolName of pools) {
+      const poolType = getString(ippoolSection[poolName]['type']) || 'overload';
+      if (poolType === 'overload' || warnedPools.has(poolName)) continue;
+      warnedPools.add(poolName);
+      warnings.push(createWarning('warning', `nat/ippool/${poolName}`,
+        `IP pool "${poolName}" is type ${poolType} but is converted as a default Junos PAT pool`,
+        'Recreate the pool behaviour manually (static NAT for one-to-one; port allocation options for fixed-port-range or port-block-allocation)'));
+    }
+    const ranges = pools
+      .map((poolName) => `${getString(ippoolSection[poolName]['startip'])}-${getString(ippoolSection[poolName]['endip'])}`);
+    return ranges.length > 0 ? { type: 'dynamic-ip-pool', addresses: ranges } : { type: 'interface' };
+  };
 
   // Central SNAT map
   const csnatSection = tree['firewall central-snat-map'] || {};
   for (const [id, entry] of Object.entries(csnatSection)) {
     if (typeof entry !== 'object') continue;
+    const ruleName = getString(entry['comments']) || `Central-SNAT-${id}`;
+    const sharedIface = [...ensureArray(entry['srcintf']), ...ensureArray(entry['dstintf'])].find(sharedZoneOf);
+    if (sharedIface) {
+      warnings.push(createWarning('warning', `nat/${ruleName}`,
+        `Central SNAT "${ruleName}" matches interface "${sharedIface}", one of several members of zone "${sharedZoneOf(sharedIface)}" — not converted`,
+        `Build it manually as a rule-set scoped "from interface"/"to interface" ${sharedIface}`));
+      continue;
+    }
     natRules.push({
-      name: getString(entry['comments']) || `Central-SNAT-${id}`,
+      name: ruleName,
       type: 'source',
-      src_zones: ensureArray(entry['srcintf']),
-      dst_zones: ensureArray(entry['dstintf']),
+      src_zones: ensureArray(entry['srcintf']).map(zoneOf),
+      dst_zones: ensureArray(entry['dstintf']).map(zoneOf),
       src_addresses: ensureArray(entry['orig-addr']),
       dst_addresses: ensureArray(entry['dst-addr']),
-      translated_src: {
-        type: entry['nat-ippool'] ? 'dynamic-ip-pool' : 'interface',
-        addresses: ensureArray(entry['nat-ippool']),
-      },
+      translated_src: poolTranslation(ensureArray(entry['nat-ippool'])),
       translated_dst: null,
       translated_port: getString(entry['nat-port']) || null,
       description: getString(entry['comments']) || '',
+      _rule_index: ruleIndex++,
+    });
+  }
+
+  // Policy-level "set nat enable": outbound source NAT, unless central NAT mode
+  // makes FortiOS ignore it. Disabled policies match no traffic, so they must
+  // not translate any.
+  const centralNat = getString((tree['system settings'] || {})['central-nat']) === 'enable';
+  const acceptPolicies = centralNat ? [] : Object.entries(tree['firewall policy'] || {})
+    .filter(([, entry]) => typeof entry === 'object'
+      && getString(entry['status']) !== 'disable'
+      && mapAction(getString(entry['action'])) === 'allow')
+    .sort(([a], [b]) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0))
+    .map(([id, entry]) => {
+      const nat = getString(entry['nat']) === 'enable';
+      const translation = nat
+        ? poolTranslation(getString(entry['ippool']) === 'enable' ? ensureArray(entry['poolname']) : [])
+        : null;
+      return {
+        id,
+        entry,
+        name: getString(entry['name']) || `Policy-${id}`,
+        srcZones: ensureArray(entry['srcintf']).map(zoneOf),
+        dstZones: ensureArray(entry['dstintf']).map(zoneOf),
+        translation,
+        translationKey: JSON.stringify(translation),
+      };
+    });
+  // "any" expands to every zone at emission, so it overlaps every zone here.
+  const zonesOverlap = (zones, otherZones) => zones.includes('any') || otherZones.includes('any')
+    || zones.some((zone) => otherZones.includes(zone));
+  const sharesZonePair = (policy, other) => zonesOverlap(policy.srcZones, other.srcZones)
+    && zonesOverlap(policy.dstZones, other.dstZones);
+  // FortiGate's built-in "all" is any address.
+  const natAddresses = (value) => ensureArray(value).map((address) => (address === 'all' ? 'any' : address));
+  // Conflicts depend only on a policy's zones and translation, so scan once per distinct combination.
+  // shortcut: still quadratic if nearly every policy has its own zone set; upgrade to per-zone-pair counts if that shows up.
+  const conflictCache = new Map();
+  const conflictsOf = (policy) => {
+    const cacheKey = JSON.stringify([policy.srcZones, policy.dstZones, policy.translationKey]);
+    if (!conflictCache.has(cacheKey)) {
+      conflictCache.set(cacheKey, acceptPolicies.filter((other) => other.translationKey !== policy.translationKey
+        && sharesZonePair(policy, other)));
+    }
+    return conflictCache.get(cacheKey);
+  };
+  for (const policy of acceptPolicies) {
+    if (!policy.translation) continue;
+    // SRX source NAT cannot match a negated list; the plain list would NAT exactly the excluded traffic.
+    if (getString(policy.entry['srcaddr-negate']) === 'enable' || getString(policy.entry['dstaddr-negate']) === 'enable') {
+      warnings.push(createWarning('warning', `nat/${policy.name}`,
+        `Policy "${policy.name}" enables NAT on a negated address — source NAT not converted`,
+        'Build it manually: a "source-nat off" rule for the excluded addresses above the translating rule'));
+      continue;
+    }
+    if (getString(policy.entry['fixedport']) === 'enable') {
+      warnings.push(createWarning('warning', `nat/${policy.name}`,
+        `Policy "${policy.name}" uses fixed-port NAT, but the SRX source NAT rule translates source ports`,
+        'Use a source pool with "port no-translation" if the source port must be preserved'));
+    }
+    // shortcut: SRX source NAT matches neither policy order nor service, so a zone pair
+    // whose policies translate differently is flagged, not converted; upgrade to ordered
+    // per-policy rules with "source-nat off" and service matches.
+    const conflicting = conflictsOf(policy);
+    // Name a few conflicts, not all: a large mixed rulebase would repeat thousands per warning.
+    const conflictNames = conflicting.slice(0, 3).map((other) => `"${other.name}"`).join(', ')
+      + (conflicting.length > 3 ? ` and ${conflicting.length - 3} more` : '');
+    const caveat = conflicting.length > 0
+      ? `source NAT for policy "${policy.name}" ignores policy order and service, but ${conflictNames} in the same zone pair translate differently — review rule order and add "source-nat off" rules where needed`
+      : null;
+    if (caveat) {
+      warnings.push(createWarning('warning', `nat/${policy.name}`, caveat,
+        'Order the SRX source NAT rules to match FortiGate policy precedence, adding "then source-nat off" for traffic FortiGate leaves untranslated'));
+    }
+    natRules.push({
+      name: policy.name,
+      type: 'source',
+      src_zones: policy.srcZones,
+      dst_zones: policy.dstZones,
+      src_addresses: natAddresses(policy.entry['srcaddr']),
+      dst_addresses: natAddresses(policy.entry['dstaddr']),
+      translated_src: policy.translation,
+      translated_dst: null,
+      translated_port: null,
+      description: `Policy ${policy.id} source NAT`,
+      ...(caveat ? { caveat } : {}),
       _rule_index: ruleIndex++,
     });
   }
@@ -1901,28 +2025,6 @@ function parseNatRules(tree, warnings) {
       // FortiOS applies protocol only to port forwarding, and defaults it to tcp.
       match_protocol: portForward ? (vipProtocol || 'tcp') : null,
       description: getString(entry['comment']) || getString(entry['comments']) || '',
-      _rule_index: ruleIndex++,
-    });
-  }
-
-  // IP Pools (informational — SNAT pools)
-  const poolSection = tree['firewall ippool'] || {};
-  for (const [name, entry] of Object.entries(poolSection)) {
-    if (typeof entry !== 'object') continue;
-    natRules.push({
-      name,
-      type: 'source',
-      src_zones: [],
-      dst_zones: [],
-      src_addresses: ['any'],
-      dst_addresses: ['any'],
-      translated_src: {
-        type: 'dynamic-ip-pool',
-        addresses: [`${getString(entry['startip'])}-${getString(entry['endip'])}`],
-      },
-      translated_dst: null,
-      translated_port: null,
-      description: `IP Pool (${getString(entry['type']) || 'overload'})`,
       _rule_index: ruleIndex++,
     });
   }
