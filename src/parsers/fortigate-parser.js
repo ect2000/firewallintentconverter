@@ -242,6 +242,7 @@ export function parseFortigateConfig(configText) {
     external_lists: [],
     vpn_tunnels: vpnTunnels,
     ha_config: haConfig,
+    management_ports: parseManagementPorts(tree),
     screen_config: screenConfig,
     syslog_config: syslogConfig,
     snmp_config: parseFortigateSnmpConfig(tree, warnings),
@@ -1441,6 +1442,21 @@ function fortiSubnetToCidr(subnetStr) {
 }
 
 
+/**
+ * Custom admin ports from `config system global` (admin-ssh-port, admin-sport = HTTPS,
+ * admin-port = HTTP). Only non-default values are kept; the converter validates the range.
+ */
+function parseManagementPorts(tree) {
+  const global = tree['system global'] || {};
+  const ports = {};
+  const fields = { ssh: ['admin-ssh-port', '22'], https: ['admin-sport', '443'], http: ['admin-port', '80'] };
+  for (const [service, [field, defaultPort]] of Object.entries(fields)) {
+    const value = getString(global[field]);
+    if (value && value !== defaultPort) ports[service] = value;
+  }
+  return ports;
+}
+
 function extractVersion(tree) {
   const global = tree['system global'] || {};
   // Sometimes version is at top-level as a comment: #config-version=...
@@ -1472,6 +1488,84 @@ const ALLOWACCESS_TO_SRX_SERVICE = {
 };
 
 const accessTokens = value => ensureArray(value).flatMap(token => String(token).split(/\s+/)).filter(Boolean);
+
+// local-in-policy service names that cover a management service (ALL covers every one).
+const LOCAL_IN_SERVICE = { HTTPS: 'https', HTTP: 'http', SSH: 'ssh', TELNET: 'telnet', SNMP: 'snmp', PING: 'ping' };
+
+// Fields that do not narrow what a local-in accept matches. Anything else (internet-service-*,
+// virtual-patch, ...) may restrict it, so an entry carrying one cannot shadow a later deny.
+const LOCAL_IN_NEUTRAL_FIELDS = new Set(['intf', 'srcaddr', 'dstaddr', 'service', 'action', 'schedule', 'status', 'uuid', 'comments', 'name']);
+
+/** True when a local-in accept matches all sources and destinations, always, with no narrowing field. */
+function isUnconditionalAccept(entry) {
+  const matchesAll = field => accessTokens(entry[field]).some(value => ['all', 'any'].includes(value.toLowerCase()));
+  const schedule = getString(entry['schedule']);
+  if (schedule !== '' && schedule.toLowerCase() !== 'always') return false;
+  if (!matchesAll('srcaddr') || !matchesAll('dstaddr')) return false;
+  return Object.keys(entry).every(field => (
+    LOCAL_IN_NEUTRAL_FIELDS.has(field)
+    || getString(entry[field]) === 'disable' // full-config exports list defaults like `internet-service-src disable`
+  ));
+}
+
+/**
+ * SRX host-inbound-traffic cannot restrict sources, so a local-in-policy that restricts a
+ * management service fails closed: an enabled deny entry removes that service from the
+ * interface (every interface for `any`). Accept entries only exempt traffic and are ignored.
+ * Mutates interfaces[].allowaccess.
+ */
+function restrictByLocalInPolicies(tree, interfaces, warnings) {
+  const removedByInterface = new Map(); // interface name -> { services: Set, ids: Set }
+  const unknownServices = new Set();
+  for (const section of ['firewall local-in-policy', 'firewall local-in-policy6']) {
+    // local-in is first-match: an earlier accept-all on (interface, service) shadows a later deny.
+    const shadowed = new Set();
+    for (const [id, entry] of entriesInConfigOrder(tree[section] || {})) {
+      if (typeof entry !== 'object') continue;
+      if (getString(entry['status']) === 'disable') continue;
+      const isAccept = getString(entry['action']) === 'accept';
+      const covered = new Set();
+      for (const name of accessTokens(entry['service'])) {
+        const key = name.toUpperCase();
+        if (key === 'ALL') Object.values(LOCAL_IN_SERVICE).forEach(service => covered.add(service));
+        else if (LOCAL_IN_SERVICE[key]) covered.add(LOCAL_IN_SERVICE[key]);
+        else if (!isAccept) unknownServices.add(name);
+      }
+      // service-negate lists exclusions: the entry covers every management service NOT listed.
+      if (getString(entry['service-negate']) === 'enable') {
+        const listed = new Set(covered);
+        covered.clear();
+        for (const service of Object.values(LOCAL_IN_SERVICE)) if (!listed.has(service)) covered.add(service);
+      }
+      const names = accessTokens(entry['intf']);
+      const targets = names.includes('any') ? interfaces : interfaces.filter(iface => names.includes(iface.name));
+      if (isAccept) {
+        if (!isUnconditionalAccept(entry)) continue;
+        for (const iface of targets) covered.forEach(service => shadowed.add(`${iface.name}|${service}`));
+        continue;
+      }
+      for (const iface of targets) {
+        const removed = iface.allowaccess.filter(service => covered.has(service) && !shadowed.has(`${iface.name}|${service}`));
+        if (removed.length === 0) continue;
+        iface.allowaccess = iface.allowaccess.filter(service => !removed.includes(service));
+        const record = removedByInterface.get(iface.name) || { services: new Set(), ids: new Set() };
+        removed.forEach(service => record.services.add(service));
+        record.ids.add(id);
+        removedByInterface.set(iface.name, record);
+      }
+    }
+  }
+  for (const [name, { services, ids }] of removedByInterface) {
+    warnings.push(createWarning('warning', `interfaces/${name}/local-in-policy`,
+      `local-in-policy ${[...ids].join(', ')} restricts ${[...services].join(', ')} on interface ${name}; SRX host-inbound-traffic cannot restrict sources, so these services were removed from the interface (fail closed)`,
+      'Re-enable them with a lo0 firewall filter or junos-host security policy that limits the source addresses'));
+  }
+  if (unknownServices.size > 0) {
+    warnings.push(createWarning('warning', 'interfaces/local-in-policy',
+      `local-in-policy service(s) ${[...unknownServices].join(', ')} are not management services this converter recognises and were ignored`,
+      'Review these local-in policies manually'));
+  }
+}
 
 function parseInterfaces(tree, warnings) {
   const ifaceSection = tree['system interface'] || {};
@@ -1524,19 +1618,7 @@ function parseInterfaces(tree, warnings) {
       zone: '', // will be filled by zone data
     });
   }
-  const daemonServices = [...new Set(interfaces.flatMap(iface => iface.allowaccess))].filter(service => service !== 'ping');
-  if (daemonServices.length > 0) {
-    warnings.push(createWarning('warning', 'interfaces/allowaccess',
-      `allowaccess ${daemonServices.join(', ')} is converted to host-inbound-traffic only; the SRX service configuration (system services ssh/telnet, web-management http/https, snmp) is not generated`,
-      'Enable the matching services on the SRX, or management access on these interfaces will not work'));
-  }
-  const hasLocalIn = ['firewall local-in-policy', 'firewall local-in-policy6']
-    .some(section => Object.keys(tree[section] || {}).length > 0);
-  if (hasLocalIn && interfaces.some(iface => iface.allowaccess.length > 0)) {
-    warnings.push(createWarning('warning', 'interfaces/local-in-policy',
-      'config firewall local-in-policy restricts management access on the FortiGate but is not translated: the SRX host-inbound-traffic allows the converted allowaccess services from any source',
-      'Restrict them on the SRX with a lo0 firewall filter or junos-host security policies'));
-  }
+  restrictByLocalInPolicies(tree, interfaces, warnings);
   return interfaces;
 }
 

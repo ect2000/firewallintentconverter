@@ -129,10 +129,10 @@ end
     expect(access.v6only.system_services).toEqual(['ping', 'ssh']);
     expect(access.dual.system_services).toEqual(['ping']);
     expect(warnings.some(w => /dual: allowaccess \(ping\) and ip6-allowaccess \(ping https\) differ/.test(w.message))).toBe(true);
-    expect(warnings.some(w => /allowaccess ssh is converted to host-inbound-traffic only/.test(w.message))).toBe(true);
+    expect(warnings.some(w => /converted to host-inbound-traffic only/.test(w.message))).toBe(false);
   });
 
-  it('treats DHCP links as IPv4, ignores ::/0, and warns about local-in policies', () => {
+  it('treats DHCP links as IPv4, ignores ::/0, and leaves accept-only local-in policies alone', () => {
     const { intermediateConfig, warnings } = parseFortigateConfig(`config system interface
     edit "wan1"
         set mode dhcp
@@ -170,7 +170,7 @@ end
     const access = Object.assign({}, ...intermediateConfig.zones.map(zone => zone.interface_host_inbound_traffic || {}));
     expect(access.wan1.system_services).toEqual(['ping', 'dhcp']);
     expect(warnings.some(w => /wan1: allowaccess/.test(w.message))).toBe(false);
-    expect(warnings.some(w => /local-in-policy restricts management access/.test(w.message))).toBe(true);
+    expect(warnings.some(w => /local-in-policy/.test(w.message))).toBe(false); // accept-only entries do not restrict
   });
 
   it('warns about allowaccess on interfaces outside every zone and policy', () => {
