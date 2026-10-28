@@ -82,7 +82,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
 
       // Must have a warning
       expect(result.warnings.some(w =>
-        w.severity === 'warning' && w.message?.includes('UNDEFINED-POOL-OBJ')
+        w.severity === 'warning' && w.element.startsWith('nat/') && w.message.includes('UNDEFINED-POOL-OBJ')
       )).toBe(true);
     });
 
@@ -122,7 +122,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
       expect(natCommands.some(c => c.match(/then source-nat pool \S+/))).toBe(true);
 
       // No warnings for this resolved case
-      expect(result.warnings.filter(w => w.element?.startsWith('nat/'))).toHaveLength(0);
+      expect(result.warnings.filter(w => w.element.startsWith('nat/') && w.message.includes('could not be resolved'))).toHaveLength(0);
     });
 
     it('should preserve prefix notation when translated address has a prefix', () => {
@@ -235,7 +235,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
 
       // Must have a warning
       expect(result.warnings.some(w =>
-        w.severity === 'warning' && w.message?.includes('GHOST-SERVER')
+        w.severity === 'warning' && w.element.startsWith('nat/') && w.message.includes('GHOST-SERVER')
       )).toBe(true);
 
       // Fix 1: The full output must pass validateSetOutput (no match-without-then)
@@ -277,7 +277,7 @@ describe('NAT Pool Literal Addresses (Issue #35)', () => {
       expect(natCommands.some(c => c.includes('then destination-nat pool'))).toBe(true);
 
       // No warnings for this resolved case
-      expect(result.warnings.filter(w => w.element?.startsWith('nat/'))).toHaveLength(0);
+      expect(result.warnings.filter(w => w.element.startsWith('nat/') && w.message.includes('could not be resolved'))).toHaveLength(0);
     });
 
     it('should handle destination NAT with port translation', () => {

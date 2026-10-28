@@ -155,6 +155,10 @@ export const AnalysisEngine = {
     for (const r of (config.nat_rules || [])) {
       (r.src_addresses || []).forEach(markAddr);
       (r.dst_addresses || []).forEach(markAddr);
+      // Translated addresses (pools, DNAT targets, the private side of static NAT) are references too.
+      markAddr(r.translated_src?.address);
+      (r.translated_src?.addresses || []).forEach(markAddr);
+      markAddr(typeof r.translated_dst === 'string' ? r.translated_dst : r.translated_dst?.address);
     }
 
     // Cascade: members of used groups are also "used"
@@ -243,8 +247,8 @@ export const AnalysisEngine = {
     const dstZoneOk = eDZones.includes('any') || lDZones.every(z => eDZones.includes(z));
 
     // OUR SCHEMA: src_addresses, dst_addresses, services
-    const srcAddrOk = (earlier.src_addresses || []).includes('any');
-    const dstAddrOk = (earlier.dst_addresses || []).includes('any');
+    const srcAddrOk = !earlier.negate_source && (earlier.src_addresses || []).includes('any');
+    const dstAddrOk = !earlier.negate_destination && (earlier.dst_addresses || []).includes('any');
     const svcOk = (earlier.services || []).includes('any');
 
     return srcZoneOk && dstZoneOk && srcAddrOk && dstAddrOk && svcOk;
@@ -408,7 +412,7 @@ export const AnalysisEngine = {
   _loggingOff(config) {
     const policies = config.security_policies || [];
     // OUR SCHEMA: p.disabled (inverted), p.log_end / p.log_start
-    const noLog = policies.filter(p => !p.disabled && !p.log_end && !p.log_start);
+    const noLog = policies.filter(p => !p.disabled && !p._implicit && !p.log_end && !p.log_start);
     const count = noLog.length;
     if (!count) return { id: 'logging_off', count: 0, items: [], description: 'All enabled policies have logging enabled.' };
     const pKey = (p) => p._rule_index != null ? String(p._rule_index) : p.name;
@@ -426,9 +430,10 @@ export const AnalysisEngine = {
     const policies = config.security_policies || [];
     // OUR SCHEMA: p.disabled, p.action ('allow'|'deny'|'reject'), p.src_addresses, p.dst_addresses
     const permissive = policies.filter(p => {
-      if (p.disabled || p.action !== 'allow') return false;
-      const srcAny = (p.src_addresses || []).some(a => a === 'any' || a === 'all');
-      const dstAny = (p.dst_addresses || []).some(a => a === 'any' || a === 'all');
+      // Implicit rules model the source platform's defaults (e.g. GCP implied allow-egress); removing them changes behaviour.
+      if (p.disabled || p._implicit || p.action !== 'allow') return false;
+      const srcAny = !p.negate_source && (p.src_addresses || []).some(a => a === 'any' || a === 'all');
+      const dstAny = !p.negate_destination && (p.dst_addresses || []).some(a => a === 'any' || a === 'all');
       return srcAny && dstAny;
     });
     const count = permissive.length;
@@ -504,7 +509,7 @@ export const AnalysisEngine = {
       const hasExternalZone = srcZones.some(z => isExternalZone(z));
       if (!hasExternalZone) return false;
       const srcAddrs = p.src_addresses || [];
-      return srcAddrs.some(a => a === 'any' || a === 'all');
+      return !p.negate_source && srcAddrs.some(a => a === 'any' || a === 'all');
     });
 
     const count = flagged.length;
@@ -779,8 +784,8 @@ export const AnalysisEngine = {
       if (!DENY_ACTIONS.has(p.action) && !String(p.action || '').startsWith('reset-')) return false;
       const srcAddrs = p.src_addresses || [];
       const dstAddrs = p.dst_addresses || [];
-      const hasAnySrc = srcAddrs.some(a => a === 'any' || a === 'all');
-      const hasAnyDst = dstAddrs.some(a => a === 'any' || a === 'all');
+      const hasAnySrc = !p.negate_source && srcAddrs.some(a => a === 'any' || a === 'all');
+      const hasAnyDst = !p.negate_destination && dstAddrs.some(a => a === 'any' || a === 'all');
       const logged = p.log_start || p.log_end;
       return hasAnySrc && hasAnyDst && logged;
     });
@@ -817,6 +822,8 @@ export const AnalysisEngine = {
         dst_zones: (p.dst_zones || []).slice().sort(),
         src_addresses: (p.src_addresses || []).slice().sort(),
         dst_addresses: (p.dst_addresses || []).slice().sort(),
+        negate_source: !!p.negate_source,
+        negate_destination: !!p.negate_destination,
         applications: (p.applications || []).slice().sort(),
         services: (p.services || []).slice().sort(),
       });

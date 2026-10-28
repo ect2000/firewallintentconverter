@@ -30,6 +30,7 @@ import {
   createWarning,
   detectVendor,
   detectIpVersion,
+  buildStaticNatFields,
 } from './parser-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -279,6 +280,7 @@ export function parsePanosConfig(configText) {
 
   // Parse interface configurations
   const interfaces = parseInterfaceConfig(config, allZones, warnings);
+  applyManagementProfileAccess(config, allZones, warnings);
   const lagInterfaces = parsePanosLagInterfaces(config, warnings);
   const vwirePairs = parseVwirePairs(config, warnings);
   const hasL2 = allZones.some(z => z.zone_type === 'layer2' || z.zone_type === 'virtual-wire');
@@ -2017,6 +2019,13 @@ function parseNatRules(vsys, warnings, serviceObjects) {
 
   return ruleEntries.map((entry, index) => {
     const name = entry['@_name'] || `nat-rule-${index + 1}`;
+    // Converting a disabled rule would make it active on the SRX.
+    if (entry.disabled === 'yes' || entry.disabled === true) {
+      warnings.push(createWarning('warning', `nat-rule/${name}`,
+        `NAT rule "${name}" is disabled — not converted`,
+        'Add it to the SRX by hand, deactivated, if you want to keep it'));
+      return null;
+    }
     const srcZones = extractMembers(entry.from);
     const dstZones = extractMembers(entry.to);
     const srcAddresses = extractMembers(entry.source);
@@ -2027,11 +2036,13 @@ function parseNatRules(vsys, warnings, serviceObjects) {
     let translatedSrc = null;
     let translatedDst = null;
     let translatedPort = null;
+    let staticBidirectional = false;
     let matchProtocol = null;
     let matchPort = null;
 
     // Service match (protocol/port)
-    const serviceName = typeof entry.service === 'string' ? entry.service.trim() : '';
+    // The XML parser turns a numeric name such as <service>443</service> into a number.
+    const serviceName = entry.service == null ? '' : String(entry.service).trim();
     if (serviceName && serviceName !== 'any' && serviceName !== 'application-default') {
       const svc = serviceLookup[serviceName];
       if (svc) {
@@ -2061,6 +2072,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
         }
       } else if (srcTrans['static-ip']) {
         type = 'static';
+        staticBidirectional = String(srcTrans['static-ip']['bi-directional']).trim() === 'yes';
         translatedSrc = {
           type: 'static',
           address: srcTrans['static-ip']['translated-address'] || '',
@@ -2074,6 +2086,22 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       const dstTrans = entry['destination-translation'];
       translatedDst = dstTrans['translated-address'] || '';
       translatedPort = dstTrans['translated-port'] ? String(dstTrans['translated-port']) : null;
+    }
+
+    let staticFields = null;
+    if (type === 'static') {
+      staticFields = buildStaticNatFields({
+        name,
+        privateAddresses: srcAddresses,
+        publicAddresses: [translatedSrc.address],
+        destinationFilter: dstAddresses,
+        insideZones: srcZones,
+        outsideZones: dstZones,
+        bidirectional: staticBidirectional,
+        services: serviceName === 'application-default' ? [] : [serviceName],
+        warnings,
+      });
+      if (!staticFields) return null;
     }
 
     // Detect U-turn/hairpin NAT: source zones == destination zones with combo NAT
@@ -2099,6 +2127,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       src_addresses: srcAddresses,
       dst_addresses: dstAddresses,
       translated_src: translatedSrc,
+      ...staticFields,
       translated_dst: translatedDst,
       translated_port: translatedPort,
       match_protocol: matchProtocol || undefined,
@@ -2107,7 +2136,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       _rule_index: index + 1,
       _uturn: isUturn || undefined,
     };
-  });
+  }).filter(Boolean);
 }
 
 
@@ -2676,6 +2705,108 @@ function parseInterfaceConfig(config, zones, warnings) {
     warnings.push(createWarning('info', 'interfaces', `Parsed ${interfaces.length} interface(s)`, 'Interface configuration detected'));
   }
   return interfaces;
+}
+
+// Interface management profile flags with an SRX host-inbound system-service equivalent.
+const MGMT_FLAG_TO_SRX_SERVICE = {
+  ping: 'ping', ssh: 'ssh', https: 'https', http: 'http', telnet: 'telnet', snmp: 'snmp',
+};
+
+/**
+ * Records each zone member's interface management profile as
+ * zone.interface_host_inbound_traffic. A member with no profile allows nothing on
+ * PAN-OS, so it is recorded with empty lists; members that are not defined as
+ * interfaces, or whose profile is missing, get no access data.
+ * Profiles: devices > entry > network > profiles > interface-management-profile;
+ * references: <interface-management-profile> on the interface layer3 node or unit.
+ */
+function applyManagementProfileAccess(config, zones, warnings) {
+  const devices = getNestedValue(config, 'devices');
+  if (!devices) return;
+  const profiles = {};
+  const profileByInterface = {}; // interface or unit name -> profile name ('' = none)
+  for (const device of extractEntries(devices)) {
+    const profileContainer = getNestedValue(device, 'network.profiles.interface-management-profile');
+    for (const profile of profileContainer ? extractEntries(profileContainer) : []) {
+      profiles[profile['@_name']] = profile;
+    }
+    const interfaceTypes = getNestedValue(device, 'network.interface');
+    for (const container of Object.values(interfaceTypes || {})) {
+      if (!container || typeof container !== 'object') continue;
+      // loopback/tunnel/vlan keep their units directly under the type node (loopback.1, tunnel.1).
+      for (const unit of container.units ? extractEntries(container.units) : []) {
+        if (unit['@_name']) profileByInterface[unit['@_name']] = String(unit['interface-management-profile'] ?? '');
+      }
+      for (const entry of extractEntries(container)) {
+        const ifName = entry['@_name'];
+        if (!ifName) continue;
+        const holder = getNestedValue(entry, 'layer3') || entry;
+        const profileOf = node => String(node['interface-management-profile'] ?? '');
+        profileByInterface[ifName] = profileOf(holder);
+        const units = getNestedValue(holder, 'units') || getNestedValue(entry, 'units');
+        for (const unit of units ? extractEntries(units) : []) {
+          if (unit['@_name']) profileByInterface[unit['@_name']] = profileOf(unit);
+        }
+      }
+    }
+  }
+
+  const accessOf = new Map(); // profile name -> services array, or null when undefined
+  const servicesForProfile = (profileName) => {
+    if (profileName === '') return [];
+    if (accessOf.has(profileName)) return accessOf.get(profileName);
+    const profile = profiles[profileName];
+    if (!profile) {
+      warnings.push(createWarning('warning', `interfaces/${profileName}`,
+        `Interface management profile "${profileName}" is not defined in this config; no host-inbound-traffic was generated for interfaces using it`,
+        'Add host-inbound-traffic on these SRX interfaces manually'));
+      accessOf.set(profileName, null);
+      return null;
+    }
+    const systemServices = [];
+    const unmapped = [];
+    for (const [flag, value] of Object.entries(profile)) {
+      if (flag.startsWith('@_') || flag === 'permitted-ip' || String(value) !== 'yes') continue;
+      if (MGMT_FLAG_TO_SRX_SERVICE[flag]) systemServices.push(MGMT_FLAG_TO_SRX_SERVICE[flag]);
+      else unmapped.push(flag);
+    }
+    if (unmapped.length > 0) {
+      warnings.push(createWarning('warning', `interfaces/${profileName}`,
+        `Interface management profile "${profileName}": ${unmapped.join(', ')} has no SRX host-inbound-traffic equivalent and was dropped`,
+        'Configure the equivalent service on the SRX manually if needed'));
+    }
+    if (profile['permitted-ip']) {
+      // Fail closed: host-inbound-traffic cannot restrict sources, so granting would widen exposure.
+      const permittedIps = extractEntries(profile['permitted-ip']).map(entry => entry['@_name']).join(', ');
+      warnings.push(createWarning('warning', `interfaces/${profileName}`,
+        `Interface management profile "${profileName}" is restricted to ${permittedIps} (permitted-ip) and its services (${systemServices.join(', ') || 'none'}) were not converted; SRX host-inbound-traffic cannot restrict sources`,
+        'Allow them with a lo0 firewall filter or a junos-host security policy'));
+      accessOf.set(profileName, []);
+      return [];
+    }
+    accessOf.set(profileName, systemServices);
+    return systemServices;
+  };
+
+  const zonedInterfaces = new Set(zones.flatMap(zone => zone.interfaces || []));
+  const unzoned = Object.entries(profileByInterface)
+    .filter(([ifName, profileName]) => profileName !== '' && !zonedInterfaces.has(ifName) && servicesForProfile(profileName)?.length > 0)
+    .map(([ifName]) => ifName);
+  if (unzoned.length > 0) {
+    warnings.push(createWarning('warning', 'interfaces/management-profile',
+      `Interface management profile access on ${unzoned.join(', ')} was not converted: these interfaces are in no zone`,
+      'Add each interface to a security zone on the SRX with the host-inbound-traffic it needs'));
+  }
+
+  for (const zone of zones) {
+    for (const ifName of zone.interfaces || []) {
+      if (!(ifName in profileByInterface)) continue;
+      const systemServices = servicesForProfile(profileByInterface[ifName]);
+      if (!systemServices) continue;
+      zone.interface_host_inbound_traffic ??= {};
+      zone.interface_host_inbound_traffic[ifName] = { system_services: [...systemServices], protocols: [] };
+    }
+  }
 }
 
 /**

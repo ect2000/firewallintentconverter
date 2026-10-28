@@ -7,12 +7,14 @@
  * they cannot drift apart.
  */
 
-import { createWarning, planIngressScopeAdvice } from '../parsers/parser-utils.js';
+import { createWarning, planIngressScopeAdvice, planInterfaceScopedIngress } from '../parsers/parser-utils.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 
 const IPV4_ADDRESS = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/;
 // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
 const IPV4_RANGE = /^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/;  // njsscan-ignore: regex_dos
+// Junos accepts at most eight source and eight destination addresses in one source NAT rule.
+const NAT_MATCH_ADDRESS_LIMIT = 8;
 
 /** True for a full or "::"-compressed IPv6 address, so names like "dead:beef" are not literals. */
 function isIpv6Address(text) {
@@ -29,8 +31,8 @@ function isLiteralAddress(addr) {
   return rest.length === 0 && (prefixLength === undefined || /^\d{1,3}$/.test(prefixLength)) && isIpv6Address(address);
 }
 
-/** Returns '::/0' for rules touching IPv6 addresses, else '0.0.0.0/0'. */
-function natAnyAddress(rule) {
+/** Returns '::/0' for rules touching IPv6 addresses, else '0.0.0.0/0'; `valueOf` resolves object names. */
+function natAnyAddressWith(rule, valueOf = addr => addr) {
   const allAddrs = [
     ...(rule.src_addresses || []),
     ...(rule.dst_addresses || []),
@@ -39,7 +41,7 @@ function natAnyAddress(rule) {
     ...(rule.translated_dst?.address ? [rule.translated_dst.address] : []),
     ...(typeof rule.translated_dst === 'string' ? [rule.translated_dst] : []),
   ];
-  return allAddrs.some(a => a && typeof a === 'string' && a.includes(':')) ? '::/0' : '0.0.0.0/0';
+  return allAddrs.some(a => a && typeof a === 'string' && String(valueOf(a)).includes(':')) ? '::/0' : '0.0.0.0/0';
 }
 
 function effectiveNatTypes(rule) {
@@ -70,15 +72,20 @@ function natMissingZoneRole(sourceName) {
   return `nat-missing-zone:${sourceName}`;
 }
 
-/** Groups NAT rules by source-zone to destination-zone pair (one SRX rule-set each). */
-function groupByZonePair(rules) {
+/**
+ * Groups NAT rules by source-zone to destination-zone pair (one SRX rule-set each).
+ * `scopeOf(rule)` names an ingress interface that splits the pair into its own rule-set.
+ */
+function groupByZonePair(rules, scopeOf = () => null) {
   const groups = [];
   for (const rule of rules) {
+    const scopeInterface = scopeOf(rule);
     for (const fromZone of natSourceZones(rule)) {
       for (const toZone of natDestinationZones(rule)) {
-        let group = groups.find(item => item.fromZone === fromZone && item.toZone === toZone);
+        let group = groups.find(item => item.fromZone === fromZone && item.toZone === toZone
+          && item.scopeInterface === scopeInterface);
         if (!group) {
-          group = { fromZone, toZone, rules: [] };
+          group = { fromZone, toZone, scopeInterface, rules: [] };
           groups.push(group);
         }
         group.rules.push(rule);
@@ -111,6 +118,33 @@ function prefixBounds({ address, length }) {
   return { first, last: first + size - 1 };
 }
 
+const ipv4ToInteger = text => text.split('.').reduce((total, octet) => total * 256 + Number(octet), 0);
+const isIpv4Address = text => /^\d{1,3}(\.\d{1,3}){3}$/.test(text) && text.split('.').every(octet => Number(octet) <= 255);
+
+/**
+ * Expands an IPv4 range into the minimal CIDR prefixes that cover it exactly.
+ *
+ * @param {string} start - First address, dotted quad
+ * @param {string} end - Last address, dotted quad
+ * @returns {string[]|null} Prefixes ("A.B.C.D/len"), or null when an address is invalid or start > end
+ */
+export function ipv4RangeToPrefixes(start, end) {
+  if (!isIpv4Address(start) || !isIpv4Address(end)) return null;
+  let next = ipv4ToInteger(start);
+  const last = ipv4ToInteger(end);
+  if (next > last) return null;
+  const prefixes = [];
+  while (next <= last) {
+    // Largest power-of-two block that is aligned at `next` and still ends by `last`.
+    let size = next === 0 ? 2 ** 32 : Math.abs(next & -next);
+    while (next + size - 1 > last) size /= 2;
+    const dotted = [24, 16, 8, 0].map(shift => Math.floor(next / 2 ** shift) % 256).join('.');
+    prefixes.push(`${dotted}/${32 - Math.log2(size)}`);
+    next += size;
+  }
+  return prefixes;
+}
+
 const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
 
 /**
@@ -119,12 +153,15 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  * Plan shape (resolved decisions only, no output syntax):
  * - missingZones: generated names of NAT zones absent from config.zones
  * - source / destination / static: rule-set arrays, or null when no rule has that type
- * - rule-set: { type, name, fromZones, toZones, comments, skipped, rules }
- * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort },
+ * - rule-set: { type, name, fromZones, toZones, fromInterfaces?, comments, skipped, rules }
+ *   (a destination rule-set has fromInterfaces instead of fromZones when its VIP interface shares a zone)
+ * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort | destinationPorts },
  *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value };
- *           destinationPort is { name, high? } ("high" for a start-end range);
+ *           destinationPort is { name, high? } ("high" for a start-end range); source rules
+ *           carry destinationPorts, an array of those (Junos takes several per rule);
  *           destination and static rules keep one destination entry (Junos takes one)
- * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }] } }
+ * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }], noPortTranslation?, hostAddressBase?,
+ *         blockAllocation?: { blockSize?, maximumBlocksPerHost? }, deterministic?: { hostAddress } } }
  *       | { kind: 'destination-pool', pool: { name, prefix, port } } | { kind: 'static-prefix', prefix }
  * - comments are plain text; the emitters add their own comment syntax
  * - proxyArp: [{ interface, address, to? }] host addresses and ranges (/32 forms) the SRX must
@@ -175,14 +212,14 @@ export function planNat({
     if (!resolved) {
       warnings.push(createWarning('warning', element,
         `NAT match address "${addr}" is not a known address object — skipped`,
-        'Define the address as an IP/prefix object before converting NAT'));
+        'Define the address object, or use an IP/prefix in the NAT rule'));
       return null;
     }
     // Skip FQDN / dns-name values (not usable in NAT match)
     if (!/^\d+\.\d+\.\d+\.\d+/.test(resolved) && !/^[0-9a-fA-F:]+/.test(resolved)) {
       warnings.push(createWarning('warning', element,
         `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`,
-        'Use an IP/prefix object for this NAT address'));
+        'Replace the FQDN with an IP/prefix in the NAT rule'));
       return null;
     }
     return resolved;
@@ -193,6 +230,8 @@ export function planNat({
     const literal = isLiteralAddress(rawAddress) && !rawAddressNames.has(rawAddress);
     return resolveNatAddress(literal ? rawAddress : plannedName, element);
   };
+  // Object names carry no colon, so the wildcard family follows the address each name resolves to.
+  const natAnyAddress = rule => natAnyAddressWith(rule, addr => addrLookup[rawAddressNames.get(addr) || addr] || addr);
   const translatedAddress = (rawAddress, element) => (
     resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress, element)
   );
@@ -236,22 +275,23 @@ export function planNat({
       : `nat_rules[${ruleIndex}]#effective-${direction}-zone`;
     return naming.reference(localPath);
   };
-  const ruleSetName = (type, fromZone, toZone) => {
+  // A VIP whose interface shares its zone gets a `from interface` rule-set; null keeps the zone scope.
+  const interfaceScopes = planInterfaceScopedIngress(natRules, zones);
+  const destinationScope = rule => interfaceScopes.get(rule) ?? null;
+  const ruleSetName = (type, fromZone, toZone, scopeInterface = null) => {
     const ownerIndex = natRules.findIndex(rule => (
       effectiveNatTypes(rule).includes(type)
       && natSourceZones(rule).includes(fromZone)
-      && natDestinationZones(rule).includes(toZone)
+      && (type === 'static' || natDestinationZones(rule).includes(toZone))
+      && (type !== 'destination' || destinationScope(rule) === scopeInterface)
     ));
-    const role = type === 'static'
-      ? 'static-nat-rule-set'
-      : `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
-    return naming.generated(`nat_rules[${ownerIndex}]`, role);
+    return naming.generated(`nat_rules[${ownerIndex}]`, `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone, scopeInterface)}`);
   };
   const ruleNameFor = (ruleIndex, rule, type, fromZone, toZone) => {
     let occurrence = 0;
     for (const candidateType of effectiveNatTypes(rule)) {
       const pairs = candidateType === 'static'
-        ? [['STATIC-NAT', '*']]
+        ? natSourceZones(rule).map(source => [source, '*'])
         : natSourceZones(rule).flatMap(source => (
           natDestinationZones(rule).map(destination => [source, destination])
         ));
@@ -298,7 +338,7 @@ export function planNat({
    * Plans one match field. A field that listed addresses but resolved none
    * must not become "match anything", so it reports `unresolved`.
    */
-  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, element }) => {
+  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, limit = Infinity, element }) => {
     const addresses = rule[field];
     if (!Array.isArray(addresses)) return { entries: keepAny ? [{ kind: 'prefix', value: anyAddress }] : [], unresolved: false };
     const entries = [];
@@ -316,15 +356,38 @@ export function planNat({
       } else {
         const resolved = matchAddress(ruleIndex, field, addressIndex, addr, element);
         if (!resolved) continue;
-        entries.push({ kind: 'prefix', value: resolved });
+        // Junos NAT match fields take prefixes, not "start-end", so a range becomes its covering prefixes.
+        const range = resolved.match(IPV4_RANGE);
+        const prefixes = range ? ipv4RangeToPrefixes(range[1], range[2]) : [resolved];
+        if (!prefixes || (!range && /^[0-9a-fA-F:]+-[0-9a-fA-F:]+$/.test(resolved))) {
+          warnings.push(createWarning(
+            'warning',
+            `nat/${rule.type || 'source'}/${rule.name || ruleIndex}`,
+            `NAT match address "${oneLine(addr)}" is a range (${oneLine(resolved)}) that cannot be expressed as IPv4 prefixes — skipped`,
+            'Replace the range with IPv4 prefixes, then add the NAT rule manually',
+          ));
+          continue;
+        }
+        entries.push(...prefixes.map(prefix => ({ kind: 'prefix', value: prefix })));
         succeeded += 1;
       }
     }
+    // Over the limit the rule can't commit, and dropping addresses would change what it matches.
+    if (entries.length > limit) return { entries: [], unresolved: true, overLimit: entries.length };
     return { entries, unresolved: addresses.length > 0 && succeeded === 0 };
   };
-  const skipUnresolved = (type, ruleName, field, rule) => {
+  const skipUnresolved = (type, ruleName, field, rule, fieldPlan = {}) => {
     const label = field === 'src_addresses' ? 'source' : 'destination';
     const listed = oneLine(rule[field].join(', '));
+    if (fieldPlan.overLimit) {
+      warnings.push(createWarning(
+        'warning',
+        `nat/${type}/${ruleName}`,
+        `NAT rule "${ruleName}" skipped — its ${label} addresses (${listed}) need ${fieldPlan.overLimit} prefixes, and Junos allows ${NAT_MATCH_ADDRESS_LIMIT} per rule`,
+        `Split the rule so each part matches at most ${NAT_MATCH_ADDRESS_LIMIT} ${label} addresses, then add it manually`,
+      ));
+      return `NAT: ${type} rule "${ruleName}" skipped — ${fieldPlan.overLimit} ${label} prefixes exceed the Junos limit of ${NAT_MATCH_ADDRESS_LIMIT}`;
+    }
     warnings.push(createWarning(
       'warning',
       `nat/${type}/${ruleName}`,
@@ -345,6 +408,12 @@ export function planNat({
     const range = port.match(/^(\d+)-(\d+)$/);  // njsscan-ignore: regex_dos
     return range ? { name: range[1], high: range[2] } : { name: port };
   };
+  // A source rule may list several ports ("match_ports"); a single "match_port" stays one entry.
+  const planPorts = rule => (
+    Array.isArray(rule.match_ports)
+      ? rule.match_ports.map(port => planPort({ match_port: port })).filter(Boolean)
+      : [planPort(rule)].filter(Boolean)
+  );
   // Junos takes one destination address per DNAT/static rule; later ones would silently replace it.
   const firstDestination = (type, ruleName, entries, anyAddress) => {
     if (entries.length <= 1) return entries;
@@ -364,7 +433,45 @@ export function planNat({
     rule.caveat ? [`CAVEAT: ${oneLine(rule.caveat)}`] : []
   );
 
-  const planSourceThen = (ruleIndex, rule, comments, element) => {
+  // One-way static NAT keeps ports and, for a subnet, host N -> public host N, so both sides must match in size.
+  const oneWayPoolMapping = (sourceEntries, publicPrefix) => {
+    const privateEntries = sourceEntries.filter(entry => entry.kind === 'prefix');
+    if (privateEntries.length !== 1 || privateEntries.length !== sourceEntries.length) {
+      return { error: 'its source is not a single address or subnet' };
+    }
+    const privatePrefix = withPrefix(privateEntries[0].value);
+    const lengthOf = prefix => prefix.split('/')[1];
+    if (lengthOf(privatePrefix) !== lengthOf(publicPrefix)) {
+      return { error: `its private side (${privatePrefix}) and public side (${publicPrefix}) differ in size` };
+    }
+    const isHost = lengthOf(privatePrefix) === (privatePrefix.includes(':') ? '128' : '32');
+    return isHost ? {} : { hostAddressBase: privatePrefix };
+  };
+
+  // Pool port behaviour: one pool per rule, so the flags are plain properties both emitters render.
+  const applyPoolMode = (pool, translated, rule) => {
+    if (translated.no_port_translation || translated.pool_mode === 'no-translation') {
+      pool.noPortTranslation = true;
+    } else if (translated.pool_mode === 'block-allocation') {
+      pool.blockAllocation = {
+        ...(translated.block_size ? { blockSize: translated.block_size } : {}),
+        ...(translated.max_blocks_per_host ? { maximumBlocksPerHost: translated.max_blocks_per_host } : {}),
+      };
+    } else if (translated.pool_mode === 'deterministic') {
+      // Deterministic NAT maps a fixed inside range, so it needs that range as one prefix.
+      const range = String(translated.source_range || '').match(IPV4_RANGE);
+      const prefixes = range ? ipv4RangeToPrefixes(range[1], range[2]) : null;
+      if (prefixes?.length === 1) {
+        pool.deterministic = { hostAddress: prefixes[0] };
+      } else {
+        warnings.push(createWarning('warning', `nat/source/${rule.name}`,
+          `Source NAT rule "${oneLine(rule.name)}" uses a fixed-port-range pool whose source range "${oneLine(translated.source_range)}" is not one prefix — converted as a default Junos PAT pool`,
+          'Build the deterministic NAT pool manually (port deterministic host address)'));
+      }
+    }
+  };
+
+  const planSourceThen = (ruleIndex, rule, comments, sourceEntries, element) => {
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
     if (!translated) return interfaceThen;
@@ -396,7 +503,9 @@ export function planNat({
         // A pool range the source disabled ARP replies for is left to the user's own ARP setup.
         const arpDisabled = translated.arp_reply_disabled || [];
         if (rule.arp_reply !== false) addProxyCandidates(addresses.filter((_, index) => !arpDisabled.includes(translated.addresses[index])), natDestinationZones(rule));
-        return { kind: 'pool', pool: { name: poolName, addresses } };
+        const pool = { name: poolName, addresses };
+        applyPoolMode(pool, translated, rule);
+        return { kind: 'pool', pool };
       }
       // Can't resolve pool addresses (e.g. Check Point hide NAT using a gateway name)
       comments.push('NAT pool address could not be resolved — using interface NAT');
@@ -406,13 +515,22 @@ export function planNat({
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
       const resolved = translatedAddress(translated.address, element);
       if (resolved) {
-        if (rule.arp_reply !== false) addProxyCandidates([{ prefix: withPrefix(resolved) }], natDestinationZones(rule));
-        return { kind: 'pool', pool: { name: poolName, addresses: [{ prefix: withPrefix(resolved) }] } };
+        const publicPrefix = withPrefix(resolved);
+        const pool = { name: poolName, addresses: [{ prefix: publicPrefix }] };
+        if (translated.one_way) {
+          const mapping = oneWayPoolMapping(sourceEntries, publicPrefix);
+          if (mapping.error) return { kind: 'skip', reason: mapping.error };
+          pool.noPortTranslation = true;
+          if (mapping.hostAddressBase) pool.hostAddressBase = mapping.hostAddressBase;
+        }
+        if (rule.arp_reply !== false) addProxyCandidates([{ prefix: publicPrefix }], natDestinationZones(rule));
+        return { kind: 'pool', pool };
       }
+      if (translated.one_way) return { kind: 'skip', reason: `its translated address "${oneLine(translated.address)}" could not be resolved to an IP/prefix` };
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
       warnings.push(createWarning('warning', element,
         `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`,
-        'Resolve the translated source address or verify interface NAT manually'));
+        'Check the translated address; interface NAT may not match the source rule'));
       return interfaceThen;
     }
     // Unknown translation type: default to interface NAT (e.g. Check Point hide NAT)
@@ -460,23 +578,30 @@ export function planNat({
         ruleSet.rules.push(planned);
 
         const anyAddress = natAnyAddress(rule);
-        const element = `nat/source/${name}`;
-        const options = { anyAddress, allowGroups: true, keepAny: true, element };
+        const options = { anyAddress, allowGroups: true, keepAny: true, limit: NAT_MATCH_ADDRESS_LIMIT, element: `nat/source/${name}` };
         const source = planMatchField(ruleIndex, rule, 'src_addresses', options);
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses', options);
         const unresolvedField = source.unresolved ? 'src_addresses' : (destination.unresolved ? 'dst_addresses' : null);
         if (unresolvedField) {
           planned.skipped = true;
-          comments.push(skipUnresolved('source', name, unresolvedField, rule));
+          comments.push(skipUnresolved('source', name, unresolvedField, rule, source.unresolved ? source : destination));
           continue;
         }
         planned.match = {
           source: source.entries,
           destination: destination.entries,
           protocol: planProtocol(rule),
-          destinationPort: planPort(rule),
+          destinationPorts: planPorts(rule),
         };
-        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, element);
+        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, source.entries, options.element);
+        if (planned.then.kind === 'skip') {
+          planned.skipped = true;
+          comments.push(`WARNING: Static NAT rule ${name} skipped — ${planned.then.reason}`);
+          warnings.push(createWarning('warning', `nat/static/${rule.name || ruleIndex}`,
+            `Static NAT rule "${oneLine(rule.name || ruleIndex)}" skipped — ${planned.then.reason}, which a one-way Junos source pool cannot express`,
+            'Build the NAT rule manually'));
+          continue;
+        }
         // U-turn/hairpin NAT: persistent-nat for return traffic
         planned.persistent = Boolean(rule._uturn);
       }
@@ -486,11 +611,11 @@ export function planNat({
 
   const planDestinationRuleSets = destinationRules => {
     const ruleSets = [];
-    for (const { fromZone, toZone, rules } of groupByZonePair(destinationRules)) {
+    for (const { fromZone, toZone, scopeInterface, rules } of groupByZonePair(destinationRules, destinationScope)) {
       const zoneRule = rules[0];
       const zoneRuleIndex = natRuleIndex.get(zoneRule);
-      const name = ruleSetName('destination', fromZone, toZone);
-      const ruleSet = { type: 'destination', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+      const name = ruleSetName('destination', fromZone, toZone, scopeInterface);
+      const ruleSet = { type: 'destination', name, fromZones: [], toZones: [], fromInterfaces: [], comments: [], skipped: false, rules: [] };
       ruleSets.push(ruleSet);
       if (fromZone === 'any') {
         if (actualZones.length === 0) {
@@ -503,10 +628,14 @@ export function planNat({
         }
         ruleSet.fromZones = actualZones;
       } else {
-        ruleSet.fromZones = [zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)];
+        // The zone stays referenced for naming; Junos scopes the rule-set by interface instead.
+        const zoneName = zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone);
+        if (scopeInterface) ruleSet.fromInterfaces = [mapInterface(scopeInterface)];
+        else ruleSet.fromZones = [zoneName];
       }
 
-      for (const advice of planIngressScopeAdvice(rules, zones, mapInterface)) {
+      // An interface-scoped rule-set is already exact; only zone-scoped ones need advice.
+      for (const advice of scopeInterface ? [] : planIngressScopeAdvice(rules, zones, mapInterface)) {
         ruleSet.comments.push(`CAVEAT: ${oneLine(advice.caveat)}`);
         const adviceTarget = advice.grouped
           ? name
@@ -533,7 +662,7 @@ export function planNat({
               comments.push(`NAT: destination rule "${ruleName}" skipped — translated destination "${rawDestination}" is not a resolvable IP/prefix`);
               warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
                 `Destination NAT rule "${ruleName}" skipped — translated address "${rawDestination}" could not be resolved to an IP/prefix`,
-                'Define a translated IP/prefix and add the destination NAT rule manually'));
+                'Build the destination NAT rule manually'));
               continue;
             }
           }
@@ -568,51 +697,102 @@ export function planNat({
     return ruleSets;
   };
 
+  // Junos static rule-sets take only a "from"; rules group by the zone their traffic arrives from.
   const planStaticRuleSets = staticRules => {
-    const name = naming.generated(`nat_rules[${natRuleIndex.get(staticRules[0])}]`, 'static-nat-rule-set');
-    const ruleSet = { type: 'static', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+    const groups = new Map();
     for (const rule of staticRules) {
-      const ruleIndex = natRuleIndex.get(rule);
-      const ruleName = ruleNameFor(ruleIndex, rule, 'static', 'STATIC-NAT', '*');
-      const comments = [];
-      const planned = { name: ruleName, comments, skipped: false };
-      ruleSet.rules.push(planned);
-
-      const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-        { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false, element: `nat/static/${ruleName}` });
-      if (destination.unresolved) {
-        planned.skipped = true;
-        comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
-        continue;
+      for (const fromZone of natSourceZones(rule)) {
+        if (!groups.has(fromZone)) groups.set(fromZone, []);
+        groups.get(fromZone).push(rule);
       }
-      let prefix = null;
-      if (rule.translated_src && rule.translated_src.address) {
-        prefix = translatedAddress(rule.translated_src.address, `nat/static/${ruleName}`);
-        if (!prefix) {
-          planned.skipped = true;
-          comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
-          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
-            `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
-            'Define a translated IP/prefix and add the static NAT rule manually'));
+    }
+    const ruleSets = [];
+    for (const [fromZone, rules] of groups) {
+      const zoneRule = rules[0];
+      const name = ruleSetName('static', fromZone, '*');
+      const ruleSet = { type: 'static', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+      ruleSets.push(ruleSet);
+      if (fromZone === 'any') {
+        if (actualZones.length === 0) {
+          ruleSet.skipped = true;
+          ruleSet.comments.push(`WARNING: Static NAT rule-set ${fromZone} skipped — no defined zones`);
+          warnings.push(createWarning('warning', `nat/static/${fromZone}`,
+            `Static NAT rule-set from ${fromZone} skipped — 'any' is not valid and no zones defined`,
+            'Define security zones before NAT rules'));
           continue;
         }
+        ruleSet.fromZones = actualZones;
+      } else {
+        ruleSet.fromZones = [zoneReference(natRuleIndex.get(zoneRule), zoneRule, 'source', fromZone)];
       }
-      // Junos needs both a destination match and a translated prefix for a static rule.
-      if (destination.entries.length === 0 || !prefix) {
-        planned.skipped = true;
-        comments.push(`NAT: static rule "${ruleName}" skipped — it needs both a destination match and a translated prefix`);
-        warnings.push(createWarning('warning', `nat/static/${ruleName}`,
-          `Static NAT rule "${ruleName}" skipped — a destination match and a translated prefix could not both be built from the source rule`,
-          'Build the static NAT rule manually'));
-        continue;
+
+      for (const rule of rules) {
+        const ruleIndex = natRuleIndex.get(rule);
+        const ruleName = ruleNameFor(ruleIndex, rule, 'static', fromZone, '*');
+        const comments = [];
+        const planned = { name: ruleName, comments, skipped: false };
+        ruleSet.rules.push(planned);
+
+        // One mapping in several rule-sets would give the same address two static translations.
+        const ruleZones = natSourceZones(rule);
+        if (ruleZones.length > 1) {
+          planned.skipped = true;
+          comments.push(`NAT: static rule "${ruleName}" skipped — it is reached from ${ruleZones.length} zones (${oneLine(ruleZones.join(', '))})`);
+          if (fromZone === ruleZones[0]) {
+            warnings.push(createWarning('warning', `nat/static/${oneLine(rule.name || ruleIndex)}`,
+              `Static NAT rule "${oneLine(rule.name || ruleIndex)}" skipped — it is reached from several zones (${oneLine(ruleZones.join(', '))}), and one mapping must live in one static rule-set`,
+              'Build one static NAT rule-set with all of these from zones manually'));
+          }
+          continue;
+        }
+
+        const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
+          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false, element: `nat/static/${ruleName}` });
+        if (destination.unresolved) {
+          planned.skipped = true;
+          comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
+          continue;
+        }
+        let prefix = null;
+        if (rule.translated_src && rule.translated_src.address) {
+          prefix = translatedAddress(rule.translated_src.address, `nat/static/${ruleName}`);
+          if (!prefix) {
+            planned.skipped = true;
+            comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
+            warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+              `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
+              'Build the static NAT rule manually'));
+            continue;
+          }
+        }
+        // Junos needs both a destination match and a translated prefix for a static rule.
+        if (destination.entries.length === 0 || !prefix) {
+          planned.skipped = true;
+          comments.push(`NAT: static rule "${ruleName}" skipped — it needs both a destination match and a translated prefix`);
+          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+            `Static NAT rule "${ruleName}" skipped — a destination match and a translated prefix could not both be built from the source rule`,
+            'Build the static NAT rule manually'));
+          continue;
+        }
+        const matchEntries = firstDestination('static', ruleName, destination.entries, natAnyAddress(rule))
+          .map(entry => ({ ...entry, value: withPrefix(entry.value) }));
+        // Static NAT maps one block onto another, so both sides must have the same prefix length.
+        const publicLength = withPrefix(matchEntries[0].value).split('/')[1];
+        if (publicLength !== withPrefix(prefix).split('/')[1]) {
+          planned.skipped = true;
+          comments.push(`NAT: static rule "${ruleName}" skipped — public ${matchEntries[0].value} and private ${prefix} differ in prefix length`);
+          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+            `Static NAT rule "${ruleName}" skipped — public ${oneLine(matchEntries[0].value)} and private ${oneLine(prefix)} differ in prefix length, and Junos static NAT maps equal-size blocks`,
+            'Build the static NAT rule manually'));
+          continue;
+        }
+        planned.match = { source: [], destination: matchEntries, protocol: null, destinationPort: null };
+        planned.then = { kind: 'static-prefix', prefix };
+        // The SRX must answer ARP for the public address, scoped to the zones the traffic arrives from.
+        addProxyCandidates(destinationCandidates(rule, matchEntries, natAnyAddress(rule)), natSourceZones(rule));
       }
-      planned.match = { source: [], destination: firstDestination('static', ruleName, destination.entries, natAnyAddress(rule)), protocol: null, destinationPort: null };
-      planned.then = { kind: 'static-prefix', prefix };
-      // shortcut: no proxy ARP for static NAT. Parsers put the source rule's destination filter in
-      // dst_addresses, not the public address, so proxying it could claim a real host; upgrade
-      // once static rules carry the public address explicitly.
     }
-    return [ruleSet];
+    return ruleSets;
   };
 
   const rulesOfType = type => natRules.filter(rule => effectiveNatTypes(rule).includes(type));

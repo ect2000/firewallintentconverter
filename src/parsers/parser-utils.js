@@ -6,6 +6,9 @@
  * validation / transformation functions.
  */
 
+import appMappingData from '../data/app-mappings.json' with { type: 'json' };
+import { VENDOR_KEY_MAP, normalizeJunosName, getAppOverride } from '../utils/app-mappings.js';
+
 /**
  * Safely parse JSON text, stripping prototype pollution keys (__proto__,
  * constructor, prototype) from all objects in the parsed tree.
@@ -105,6 +108,67 @@ export function createWarning(severity, element, message, suggestion = '') {
 }
 
 /**
+ * Builds a bidirectional static NAT rule in the Junos convention the NAT plan reads:
+ * `dst_addresses` is the public address, `translated_src.address` the private one,
+ * `src_zones` the zone the public address is reached from and `dst_zones` the inside.
+ * Returns null, with a warning, for shapes one Junos static NAT rule cannot express.
+ * A one-way mapping becomes a source-side rule (zones and addresses not swapped) that the NAT
+ * plan renders as a no-port-translation source pool.
+ *
+ * @param {Object} input
+ * @param {string} input.name - Source rule name
+ * @param {string[]} input.privateAddresses - Real (inside) addresses
+ * @param {string[]} input.publicAddresses - Mapped (outside) addresses
+ * @param {string[]} input.destinationFilter - The source rule's destination match
+ * @param {string[]} input.insideZones
+ * @param {string[]} input.outsideZones
+ * @param {boolean} [input.bidirectional=true] - False for a one-way mapping
+ * @param {string[]} [input.services=[]] - Services the mapping is scoped to ('any' is unscoped)
+ * @param {Object[]} input.warnings - Warning list to append to
+ * @returns {Object|null} The rule fields to spread into the NAT rule, or null when skipped
+ */
+export function buildStaticNatFields({
+  name, privateAddresses, publicAddresses, destinationFilter, insideZones, outsideZones,
+  bidirectional = true, services = [], warnings,
+}) {
+  const scopedServices = services.filter((service) => service && service !== 'any');
+  let reason = null;
+  // Junos static NAT translates both ways on every port, so a narrower source mapping must not widen.
+  if (scopedServices.length > 0) reason = `it is scoped to service ${scopedServices.join(', ')}`;
+  // A one-way rule is a source rule, and Junos source NAT matches a destination, so only bidirectional rejects it.
+  else if (bidirectional && (destinationFilter || []).some((address) => address !== 'any')) reason = 'it matches a specific destination';
+  else if (privateAddresses.length !== 1 || publicAddresses.length !== 1) reason = 'it maps more than one address';
+  // Identity NAT exempts traffic from other NAT rules; as static NAT it would proxy ARP for an inside host.
+  else if (privateAddresses[0] === publicAddresses[0]) reason = 'it maps an address to itself (identity NAT)';
+  if (reason) {
+    warnings.push(createWarning(
+      'warning',
+      `nat/static/${name}`,
+      `Static NAT rule "${name}" skipped — ${reason}, which one Junos static NAT rule cannot express`,
+      'Build the static NAT rule manually',
+    ));
+    return null;
+  }
+  if (!bidirectional) {
+    return {
+      type: 'source',
+      src_zones: insideZones,
+      dst_zones: outsideZones,
+      src_addresses: privateAddresses,
+      dst_addresses: (destinationFilter || []).length > 0 ? destinationFilter : ['any'],
+      translated_src: { type: 'static', address: publicAddresses[0], addresses: [publicAddresses[0]], one_way: true },
+    };
+  }
+  return {
+    src_zones: outsideZones,
+    dst_zones: insideZones,
+    src_addresses: ['any'],
+    dst_addresses: publicAddresses,
+    translated_src: { type: 'static', address: privateAddresses[0] },
+  };
+}
+
+/**
  * Detects the IP version of an address string.
  *
  * @param {string} value - Address string (e.g. "10.0.0.1/24" or "2001:db8::1/64")
@@ -173,7 +237,7 @@ export const JUNOS_PREDEFINED_APPS = new Set([
   'junos-sun-rpc-program-status', 'junos-sun-rpc-program-walld',
   'junos-sun-rpc-program-ypbind',
   // Security & Tunnel
-  'junos-ike', 'junos-ike-nat', 'junos-l2tp', 'junos-pptp',
+  'junos-ike', 'junos-ike-nat', 'junos-l2tp', 'junos-pptp', 'junos-gre',
   // IP catch-all
   'junos-tcp-any', 'junos-udp-any',
   // IM / P2P
@@ -209,6 +273,111 @@ export const JUNOS_PREDEFINED_APPS = new Set([
   'junos-smb-session', 'junos-netbios-session', 'junos-twamp',
   'junos-stun', 'junos-quic', 'junos-ocsp',
 ]);
+
+/** FortiGate predefined service names (case-sensitive). */
+const FORTIGATE_SERVICES = {
+  'HTTP': 'junos-http',
+  'HTTPS': 'junos-https',
+  'DNS': 'junos-dns-udp',
+  'FTP': 'junos-ftp',
+  'FTP_GET': 'junos-ftp',
+  'FTP_PUT': 'junos-ftp',
+  'TFTP': 'junos-tftp',
+  'SSH': 'junos-ssh',
+  'TELNET': 'junos-telnet',
+  'SMTP': 'junos-smtp',
+  'SMTPS': 'junos-smtps',
+  'POP3': 'junos-pop3',
+  'POP3S': 'junos-pop3s',
+  'IMAP': 'junos-imap',
+  'IMAPS': 'junos-imaps',
+  'SNMP': 'junos-snmp',
+  'NTP': 'junos-ntp',
+  'SYSLOG': 'junos-syslog',
+  'RDP': 'junos-rdp',
+  'SIP': 'junos-sip',
+  'SIP-MSNmessenger': 'junos-sip',
+  'H.323': 'junos-h323',
+  'PING': 'junos-ping',
+  'PING6': 'junos-icmp-any',
+  'TRACEROUTE': 'junos-traceroute',
+  'IKE': 'junos-ike',
+  'IKE_NAT_TRAVERSAL': 'junos-ike-nat',
+  'L2TP': 'junos-l2tp',
+  'PPTP': 'junos-pptp',
+  'IRC': 'junos-irc',
+  'LDAP': 'junos-ldap',
+  'LDAP_UDP': 'junos-ldap',
+  'SMB': 'junos-smb',
+  'SAMBA': 'junos-smb',
+  'DCE-RPC': 'junos-ms-rpc-epm',
+  'MS-SQL': 'junos-ms-sql',
+  'MYSQL': 'junos-mysql',
+  'RADIUS': 'junos-radius',
+  'RADIUS-OLD': 'junos-radius',
+  'WINS': 'junos-nbname',
+  'NBNAME': 'junos-nbname',
+  'NBDATAGRAM': 'junos-nbds',
+  'NBSESSION': 'junos-smb',
+  'NFS': 'junos-nfs',
+  'X-WINDOWS': 'junos-x-windows',
+  'VNC': 'junos-vnc',
+  'BGP': 'junos-bgp',
+  'OSPF': 'junos-ospf',
+  'RIP': 'junos-rip',
+  'GRE': 'junos-gre',
+  'STUN': 'junos-stun',
+  'QUIC': 'junos-quic',
+  'FINGER': 'junos-finger',
+  'GOPHER': 'junos-gopher',
+  'NNTP': 'junos-nntp',
+  'WHOIS': 'junos-whois',
+  'AH': 'junos-ipsec',
+  'ESP': 'junos-ipsec',
+  'ALL': 'any',
+  'ALL_TCP': 'junos-tcp-any',
+  'ALL_UDP': 'junos-udp-any',
+  'ALL_ICMP': 'junos-icmp-any',
+  'ALL_ICMP6': 'junos-icmp-any',
+  'webproxy': 'junos-http',
+  'DHCP': 'junos-dhcp-client',
+  'SCP': 'junos-ssh',
+  'SFTP': 'junos-ssh',
+  'TWAMP': 'junos-twamp',
+  'SNMP_TRAP': 'junos-snmp',
+  'RADIUS_ACCOUNTING': 'junos-radius-accounting',
+  'TIMESTAMP': 'junos-icmp-timestamp',
+  'INFO_REQUEST': 'junos-icmp-info',
+  'INFO_ADDRESS': 'junos-icmp-address-mask',
+  'SCCP': 'junos-sccp',
+  'PC-Anywhere': 'junos-pc-anywhere',
+  'LPR': 'junos-lpr',
+  'UUCP': 'junos-uucp',
+  'TALK': 'junos-talk',
+};
+
+/** Cisco ASA named ports / keywords. */
+const ASA_SERVICES = {
+  // Bare protocol keywords the ASA parser synthesizes from ACEs
+  'icmp': 'junos-icmp-all',
+  'icmp6': 'junos-icmp-any',
+  'ipsec': 'junos-ipsec',
+  'imap4': 'junos-imap',
+  'h323': 'junos-h323',
+  'www': 'junos-http',
+  'domain': 'junos-dns-udp',
+  'sunrpc': 'junos-sun-rpc-any',
+  'login': 'junos-rlogin',
+  'shell': 'junos-rsh',
+  'exec': 'junos-rsh',
+  'lpd': 'junos-lpr',
+};
+
+/** PAN-OS predefined service objects. */
+const PANOS_SERVICES = {
+  'service-http': 'junos-http',
+  'service-https': 'junos-https',
+};
 
 /**
  * Multi-vendor application name → Junos predefined application mapping.
@@ -369,7 +538,7 @@ const APP_MAP = {
   'syslog-ng': 'junos-syslog',
   'citrix': 'junos-winframe',
   'citrix-online': 'junos-winframe',
-  'gre': 'junos-udp-any',  // GRE is IP protocol 47 — no junos-gre predefined
+  'gre': 'junos-gre',  // IP protocol 47 (junos-defaults: application junos-gre term t1 protocol 47)
   // Misc management
   'finger': 'junos-finger',
   'gopher': 'junos-gopher',
@@ -389,95 +558,20 @@ const APP_MAP = {
   'uucp': 'junos-uucp',
   'talk': 'junos-talk',
 
-  // ── FortiGate Service Object Names (case-sensitive uppercase) ──
-  'HTTP': 'junos-http',
-  'HTTPS': 'junos-https',
-  'DNS': 'junos-dns-udp',
-  'FTP': 'junos-ftp',
-  'FTP_GET': 'junos-ftp',
-  'FTP_PUT': 'junos-ftp',
-  'TFTP': 'junos-tftp',
-  'SSH': 'junos-ssh',
-  'TELNET': 'junos-telnet',
-  'SMTP': 'junos-smtp',
-  'SMTPS': 'junos-smtps',
-  'POP3': 'junos-pop3',
-  'POP3S': 'junos-pop3s',
-  'IMAP': 'junos-imap',
-  'IMAPS': 'junos-imaps',
-  'SNMP': 'junos-snmp',
-  'NTP': 'junos-ntp',
-  'SYSLOG': 'junos-syslog',
-  'RDP': 'junos-rdp',
-  'SIP': 'junos-sip',
-  'SIP-MSNmessenger': 'junos-sip',
-  'H.323': 'junos-h323',
-  'PING': 'junos-ping',
-  'PING6': 'junos-icmp-any',
-  'TRACEROUTE': 'junos-traceroute',
-  'IKE': 'junos-ike',
-  'IKE_NAT_TRAVERSAL': 'junos-ike-nat',
-  'L2TP': 'junos-l2tp',
-  'PPTP': 'junos-pptp',
-  'IRC': 'junos-irc',
-  'LDAP': 'junos-ldap',
-  'LDAP_UDP': 'junos-ldap',
-  'SMB': 'junos-smb',
-  'SAMBA': 'junos-smb',
-  'DCE-RPC': 'junos-ms-rpc-epm',
-  'MS-SQL': 'junos-ms-sql',
-  'MYSQL': 'junos-mysql',
-  'RADIUS': 'junos-radius',
-  'RADIUS-OLD': 'junos-radius',
-  'WINS': 'junos-nbname',
-  'NBNAME': 'junos-nbname',
-  'NBDATAGRAM': 'junos-nbds',
-  'NBSESSION': 'junos-smb',
-  'NFS': 'junos-nfs',
-  'X-WINDOWS': 'junos-x-windows',
-  'VNC': 'junos-vnc',
-  'BGP': 'junos-bgp',
-  'OSPF': 'junos-ospf',
-  'RIP': 'junos-rip',
-  'GRE': 'junos-udp-any',  // GRE is IP protocol 47 — not PPTP
-  'STUN': 'junos-stun',
-  'QUIC': 'junos-quic',
-  'FINGER': 'junos-finger',
-  'GOPHER': 'junos-gopher',
-  'NNTP': 'junos-nntp',
-  'WHOIS': 'junos-whois',
-  'AH': 'junos-ipsec',
-  'ESP': 'junos-ipsec',
-  'ALL': 'any',
-  'ALL_TCP': 'junos-tcp-any',
-  'ALL_UDP': 'junos-udp-any',
-  'ALL_ICMP': 'junos-icmp-any',
-  'ALL_ICMP6': 'junos-icmp-any',
-  'webproxy': 'junos-http',
-  'DHCP': 'junos-dhcp-client',
-  'SCP': 'junos-ssh',
-  'SFTP': 'junos-ssh',
-  'TWAMP': 'junos-twamp',
-  'SNMP_TRAP': 'junos-snmp',
-  'RADIUS_ACCOUNTING': 'junos-radius-accounting',
-  'TIMESTAMP': 'junos-icmp-timestamp',
-  'INFO_REQUEST': 'junos-icmp-info',
-  'INFO_ADDRESS': 'junos-icmp-address-mask',
-  'SCCP': 'junos-sccp',
-  'PC-Anywhere': 'junos-pc-anywhere',
-  'LPR': 'junos-lpr',
-  'UUCP': 'junos-uucp',
-  'TALK': 'junos-talk',
-
-  // ── Cisco ASA Common Service Names ────────────────────────
-  'www': 'junos-http',
-  'domain': 'junos-dns-udp',
-  'sunrpc': 'junos-sun-rpc-any',
-  'login': 'junos-rlogin',
-  'shell': 'junos-rsh',
-  'exec': 'junos-rsh',
-  'lpd': 'junos-lpr',
+  ...FORTIGATE_SERVICES,
+  ...ASA_SERVICES,
 };
+
+/**
+ * True when a policy's services restrict the match: at least one entry that is
+ * not a vendor wildcard/keyword. An `application any` beside such a service
+ * must not widen the policy back to any (PAN-OS: application any AND service S = S).
+ * @param {string[]} [services]
+ * @returns {boolean}
+ */
+export function hasSpecificService(services) {
+  return (services || []).some(svc => svc !== 'any' && svc !== 'application-default' && svc !== 'service-set');
+}
 
 export function mapAppToJunos(appName, sourceVendor = '') {
   if (!appName) return null;
@@ -499,6 +593,74 @@ export function mapAppToJunos(appName, sourceVendor = '') {
   if (APP_MAP[appName]) return APP_MAP[appName];
   const normalized = appName.toLowerCase().trim();
   return APP_MAP[normalized] || null;
+}
+
+const bundledServiceCatalogs = new Map();
+
+/**
+ * Bundled app-mappings.json entries for one vendor whose Junos target is 'any'
+ * or a predefined application (confidence >= 0.8, as mapAppToJunos requires).
+ * Built from the static import, so it never depends on loadAppMappings().
+ * Keys are lower-cased vendor names/aliases; the first app wins, as in the
+ * runtime index.
+ */
+function bundledServiceCatalog(sourceVendor) {
+  if (bundledServiceCatalogs.has(sourceVendor)) return bundledServiceCatalogs.get(sourceVendor);
+  const catalog = new Map();
+  const vendorKey = VENDOR_KEY_MAP[sourceVendor];
+  for (const app of vendorKey ? appMappingData.apps : []) {
+    const vendorEntry = app.vendors[vendorKey];
+    const junosEntry = app.vendors.junos;
+    if (!vendorEntry || !junosEntry || junosEntry.confidence < 0.8) continue;
+    const target = normalizeJunosName(junosEntry.name);
+    if (target !== 'any' && !JUNOS_PREDEFINED_APPS.has(target)) continue;
+    for (const key of [vendorEntry.name, ...(vendorEntry.aliases || [])]) {
+      if (key && !catalog.has(String(key).toLowerCase())) catalog.set(String(key).toLowerCase(), target);
+    }
+  }
+  bundledServiceCatalogs.set(sourceVendor, catalog);
+  return catalog;
+}
+
+/**
+ * Resolves a policy service reference to a Junos predefined application using
+ * only the SOURCE vendor's built-in service catalog. Static (never consults
+ * app-mappings.json), so the answer is the same before and after any
+ * conversion, and another vendor's names (e.g. PAN-OS "web-browsing" in a
+ * FortiGate config) never match. Vendors whose parsers resolve services
+ * themselves keep the legacy mapAppToJunos behavior.
+ *
+ * @param {string} serviceName - Service name from the source config
+ * @param {string} [sourceVendor] - Source vendor id (fortigate, cisco_asa, panos, ...)
+ * @returns {string|null} Junos application name, 'any', or null when not a built-in
+ */
+export function mapServiceToJunos(serviceName, sourceVendor = '') {
+  if (!serviceName) return null;
+  if (JUNOS_PREDEFINED_APPS.has(serviceName)) return serviceName;
+  if (['fortigate', 'panos', 'cisco_asa'].includes(sourceVendor)) {
+    // User Settings overrides win, with mapVendorApp's semantics (explicit state, not load order)
+    const override = getAppOverride(serviceName, sourceVendor);
+    if (override) {
+      if (override._deleted) return null;
+      const target = normalizeJunosName(override.junosApp ?? (override.kind === 'predefined' ? override.name : null));
+      return target === 'any' || JUNOS_PREDEFINED_APPS.has(target) ? target : null;
+    }
+  }
+  switch (sourceVendor) {
+    case 'fortigate':
+      return FORTIGATE_SERVICES[serviceName]
+        || bundledServiceCatalog(sourceVendor).get(serviceName.toLowerCase()) || null;
+    case 'panos':
+      return PANOS_SERVICES[serviceName] || null;
+    case 'cisco_asa': {
+      if (ASA_SERVICES[serviceName]) return ASA_SERVICES[serviceName];
+      const generic = FORTIGATE_SERVICES[serviceName.toUpperCase()];
+      if (generic && generic !== 'any') return generic;
+      return bundledServiceCatalog(sourceVendor).get(serviceName.toLowerCase()) || null;
+    }
+    default:
+      return mapAppToJunos(serviceName, sourceVendor);
+  }
 }
 
 // Injected at runtime by engine.js after loadAppMappings() completes
@@ -814,6 +976,38 @@ export function findWidenedIngressScope(rule, zones) {
   if (!members.includes(interfaceName)) return { interfaceName, zone, kind: 'not-member' };
   if (members.length <= 1) return null;
   return { interfaceName, zone, kind: 'widened' };
+}
+
+/**
+ * Decides, once for all rules, which destination NAT rules can be scoped with
+ * `rule-set ... from interface`: a single-source-zone rule whose VIP interface
+ * sits in a shared zone (`widened`).
+ *
+ * Junos evaluates only the most specific matching rule-set (interface over zone),
+ * so a zone is split by interface only when EVERY destination rule entering from
+ * it qualifies; one broader rule (any interface, several zones, not a member)
+ * keeps the whole zone on the zone-scoped rule-set.
+ *
+ * @param {Object[]} natRules - All NAT rules
+ * @param {Object[]} zones - Current config.zones entries
+ * @returns {Map<Object, string>} Rule -> source interface name, only for scoped rules
+ */
+export function planInterfaceScopedIngress(natRules, zones) {
+  const candidates = new Map();
+  const blockedZones = new Set();
+  for (const rule of natRules || []) {
+    const isDestination = (rule.type || 'source') === 'destination' || rule.type === 'source-and-destination';
+    if (!isDestination) continue;
+    const scope = rule.src_zones?.length === 1 ? findWidenedIngressScope(rule, zones) : null;
+    if (scope?.kind === 'widened') {
+      candidates.set(rule, scope.interfaceName);
+      continue;
+    }
+    const entering = rule.src_zones ?? rule.source_zones;
+    for (const zone of Array.isArray(entering) && entering.length > 0 ? entering : ['any']) blockedZones.add(zone);
+  }
+  if (blockedZones.has('any')) return new Map();
+  return new Map([...candidates].filter(([rule]) => !blockedZones.has(rule.src_zones[0])));
 }
 
 /**

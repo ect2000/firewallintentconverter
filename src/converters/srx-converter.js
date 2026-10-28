@@ -18,7 +18,13 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import {
+  deriveManagementServices,
+  hostInboundEntries,
+  managementServiceSetLines,
+  warnZonesWithoutHostInbound,
+} from './srx-host-inbound.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -37,8 +43,10 @@ import {
   planMergedJunosIdentifiers,
 } from '../security/junos-identifiers.js';
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
+import { mapInterfaceName } from './srx-interface-names.js';
+import { resolveLagInterfaces, lagDeviceCount, resolveLagMemberPort } from './srx-lag-mapping.js';
 import { validateSetOutput } from '../security/junos-output-validation.js';
-import { findPolicyReferenceIssues, findNegationIssues } from '../security/policy-reference-integrity.js';
+import { findPolicyReferenceIssues, findNegationIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
 
 function serializeSetComments(commands) {
   for (let index = 0; index < commands.length; index += 1) {
@@ -55,6 +63,8 @@ function serializeSetComments(commands) {
 // Internal marker every parser puts on the implicit rules it synthesises;
 // the rules carry their own descriptions, so it is never printed.
 const INTERNAL_IMPLICIT_RULE_TAG = 'added_by_fpic';
+
+const ROOT_SYSTEM_SERVICE_LINE = /^set system services (ssh( port \d+)?$|web-management |netconf )/;
 
 /**
  * Converts an intermediate config to SRX set commands.
@@ -84,7 +94,9 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
   const targetContextPath = options.targetContextPath || 'targetContext.name';
   const commands = [];
   commands.push(setComment(versionStamp(options.llmModel), 'version'));
-  const warnings = [...identifiers.warnings];
+  const lagResolution = resolveLagInterfaces(config, interfaceMappings);
+  interfaceMappings = lagResolution.interfaceMappings;
+  const warnings = [...identifiers.warnings, ...lagResolution.warnings];
   const summary = {
     identifier_collisions_resolved: identifiers.collisionCount,
     zones_converted: 0,
@@ -129,19 +141,21 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
   unresolvedServiceApps.clear();
 
   // Generate commands in Junos hierarchy order
-  convertSystemConfig(config.system_config, commands, warnings, summary);
+  // Merged output derives services once for all slots (system services is root-level).
+  const managementServices = options.skipSystemServices ? {} : deriveManagementServices([config], warnings);
+  convertSystemConfig(config.system_config, managementServices, commands, warnings, summary);
   convertZones(config.zones, commands, warnings, summary, interfaceMappings, identifiers, identifierPath);
   convertInterfaceAddresses(config.interfaces, commands, warnings, summary, interfaceMappings);
   convertRemoteAccessPlaceholders(config.interfaces, commands, interfaceMappings, config.global_protect);
   ensureZoneInterfaceFamilies(config.zones, config.interfaces, commands, interfaceMappings);
-  convertLagInterfaces(config.lag_interfaces, commands, warnings, summary, interfaceMappings);
+  convertLagInterfaces(lagResolution.lagInterfaces, commands, warnings, summary, interfaceMappings, !options.skipLagChassis);
   convertAddressObjects(config.address_objects, commands, warnings, summary, identifiers, identifierPath);
   // Detect source vendor for 1:1 passthrough (SRX→SRX needs no app mapping)
   const sourceVendor = config.metadata?.source_vendor || '';
 
   convertAddressGroups(config.address_groups, commands, warnings, summary, identifiers, identifierPath);
   convertServiceObjects(config.service_objects, commands, warnings, summary, identifiers, identifierPath);
-  convertServiceGroups(config.service_groups, commands, warnings, summary, sourceVendor, identifiers, identifierPath);
+  convertServiceGroups(config.service_groups, commands, warnings, summary, sourceVendor, identifiers, identifierPath, findUnresolvedServiceGroups(config));
   convertApplications(config.applications, commands, warnings, summary, identifiers, identifierPath);
 
   // UTM / IDP / SecIntel — must run before security policies to build assignment maps
@@ -261,10 +275,11 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 
   commands.push(...policyCommands);
 
-  // Fix 1: When global policies exist, Junos requires a default-policy statement
+  // Junos does not require a default-policy. We emit an explicit deny-all so the output fails closed,
+  // even when loaded with `load merge`/`load set` onto a device whose existing config has permit-all.
   const hasGlobalPolicy = policyCommands.some(cmd => cmd.includes('security policies global policy'));
   if (hasGlobalPolicy) {
-    commands.push('set security policies default-policy permit-all');
+    commands.push('set security policies default-policy deny-all');
   }
 
   convertNatRules(
@@ -323,6 +338,10 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
+      if (cmd.startsWith('set chassis aggregated-devices ')) continue;
+      // Management daemons are root-level (not valid inside logical-systems or tenants);
+      // other system services lines, e.g. dhcp-local-server, stay in the context.
+      if (ROOT_SYSTEM_SERVICE_LINE.test(cmd)) continue;
       if (cmd.startsWith('set ')) {
         commands[i] = `set ${prefix} ${cmd.slice(4)}`;
       } else if (cmd.startsWith('deactivate ')) {
@@ -340,10 +359,11 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 // System Configuration Converter (Day-0)
 // ---------------------------------------------------------------------------
 
-function convertSystemConfig(systemConfig, commands, warnings, summary) {
-  if (!systemConfig) return;
+function convertSystemConfig(systemConfig, managementServices, commands, warnings, summary) {
+  const serviceLines = managementServiceSetLines(managementServices);
+  systemConfig = systemConfig || {};
 
-  const hasContent = systemConfig.hostname || systemConfig.domain_name ||
+  const hasContent = serviceLines.length > 0 || systemConfig.hostname || systemConfig.domain_name ||
     (systemConfig.dns_servers && systemConfig.dns_servers.length > 0) ||
     (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) ||
     systemConfig.timezone || systemConfig.login_banner;
@@ -378,16 +398,7 @@ function convertSystemConfig(systemConfig, commands, warnings, summary) {
     commands.push(`set system login message ${setQuoted(systemConfig.login_banner, 'system_config.login_banner')}`);
   }
 
-  const mgmt = systemConfig.management_services || {};
-  if (mgmt.ssh) {
-    commands.push('set system services ssh');
-  }
-  if (mgmt.https) {
-    commands.push('set system services web-management https system-generated-certificate');
-  }
-  if (mgmt.netconf) {
-    commands.push('set system services netconf ssh');
-  }
+  for (const line of serviceLines) commands.push(`set system services ${line}`);
 
   commands.push('');
   summary.system_config_converted = 1;
@@ -427,10 +438,11 @@ function convertZones(zones, commands, warnings, summary, interfaceMappings = {}
       }
       assignedInterfaces.set(srxIface, zoneName);
       commands.push(`set security zones security-zone ${zoneName} interfaces ${srxIface}`);
+      pushHostInbound(commands, warnings, `set security zones security-zone ${zoneName} interfaces ${srxIface}`,
+        zone.interface_host_inbound_traffic?.[iface], `zones/${zoneName}/${srxIface}`);
     }
 
-    // Allow host-inbound traffic defaults (common SRX requirement)
-    commands.push(`set security zones security-zone ${zoneName} host-inbound-traffic system-services ping`);
+    pushHostInbound(commands, warnings, `set security zones security-zone ${zoneName}`, zone.host_inbound_traffic, `zones/${zoneName}`);
 
     if (zone.description) {
       commands.push(`set security zones security-zone ${zoneName} description ${setQuoted(zone.description, 'zones.description')}`);
@@ -439,132 +451,18 @@ function convertZones(zones, commands, warnings, summary, interfaceMappings = {}
     summary.zones_converted++;
   }
 
+  warnZonesWithoutHostInbound(zones, warnings);
   commands.push('');
 }
 
-/**
- * Maps PAN-OS interface naming (ethernet1/1, ethernet1/1.100) to
- * SRX interface naming (ge-0/0/0, ge-0/0/0.100).
- *
- * This is a best-effort mapping — real deployments will need the user to
- * confirm interface assignments, which is handled in the interview phase.
- */
-function mapInterfaceName(panosIface, interfaceMappings = {}) {
-  // Check user-defined mappings first
-  if (interfaceMappings[panosIface]) {
-    const srx = interfaceMappings[panosIface];
-    // Append .0 unit if not already specified
-    return srx.includes('.') ? srx : `${srx}.0`;
+function pushHostInbound(commands, warnings, prefix, access, element) {
+  const { services, protocols } = hostInboundEntries(access, element, warnings);
+  for (const { name, except } of services) {
+    commands.push(`${prefix} host-inbound-traffic system-services ${name}${except ? ' except' : ''}`);
   }
-
-  // Strip VLAN unit for lookup, then re-add
-  const base = panosIface.split('.')[0];
-  const unit = panosIface.includes('.') ? panosIface.split('.')[1] : null;
-  if (interfaceMappings[base]) {
-    const srx = interfaceMappings[base];
-    const srxBase = srx.split('.')[0];
-    return `${srxBase}.${unit || '0'}`;
+  for (const { name, except } of protocols) {
+    commands.push(`${prefix} host-inbound-traffic protocols ${name}${except ? ' except' : ''}`);
   }
-
-  // Fallback: auto-map vendor interface naming to SRX ge-/xe- naming
-
-  // PAN-OS: ethernet1/2 → ge-0/0/1.0  (slot-1, port-1)
-  const panos = panosIface.match(/^ethernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (panos) {
-    const slot = parseInt(panos[1]) - 1;
-    const port = parseInt(panos[2]) - 1;
-    const u = panos[4] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // FortiGate: port1 → ge-0/0/0.0  (N-1)
-  const forti = panosIface.match(/^port(\d+)(\.(\d+))?$/i);
-  if (forti) {
-    const port = parseInt(forti[1]) - 1;
-    const u = forti[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // Check Point Gaia: eth0 → ge-0/0/0.0, bond0 passes through
-  const cpEth = panosIface.match(/^eth(\d+)(\.(\d+))?$/i);
-  if (cpEth) {
-    const port = parseInt(cpEth[1]);
-    const u = cpEth[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // SonicWall: X0 → ge-0/0/0.0
-  const swX = panosIface.match(/^X(\d+)(\.(\d+))?$/i);
-  if (swX) {
-    const port = parseInt(swX[1]);
-    const u = swX[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // Huawei: GigabitEthernet0/0/1 → ge-0/0/1.0
-  const hwGe = panosIface.match(/^GigabitEthernet(\d+)\/(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (hwGe) {
-    const slot = parseInt(hwGe[2]);
-    const port = parseInt(hwGe[3]);
-    const u = hwGe[5] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // Huawei: XGigabitEthernet0/0/0 → xe-0/0/0.0
-  const hwXe = panosIface.match(/^XGigabitEthernet(\d+)\/(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (hwXe) {
-    const slot = parseInt(hwXe[2]);
-    const port = parseInt(hwXe[3]);
-    const u = hwXe[5] || '0';
-    return `xe-0/${slot}/${port}.${u}`;
-  }
-
-  // Cisco ASA/IOS: GigabitEthernet1/1 (2-segment) → ge-0/0/0.0
-  const ciscoGe2 = panosIface.match(/^GigabitEthernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (ciscoGe2) {
-    const slot = parseInt(ciscoGe2[1]);
-    const port = parseInt(ciscoGe2[2]);
-    const u = ciscoGe2[4] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // Cisco: TenGigabitEthernet1/1 → xe-0/1/1.0
-  const ciscoXe = panosIface.match(/^TenGigabitEthernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (ciscoXe) {
-    const slot = parseInt(ciscoXe[1]);
-    const port = parseInt(ciscoXe[2]);
-    const u = ciscoXe[4] || '0';
-    return `xe-0/${slot}/${port}.${u}`;
-  }
-
-  // FortiGate named interfaces: internal/dmz/wan → ge-0/0/N.0
-  const fortiNamed = panosIface.match(/^(internal|dmz|wan|lan)(\d*)(\.(\d+))?$/i);
-  if (fortiNamed) {
-    const nameMap = { internal: 1, dmz: 2, wan: 3, lan: 4 };
-    const basePort = nameMap[fortiNamed[1].toLowerCase()] || 0;
-    const idx = fortiNamed[2] ? parseInt(fortiNamed[2]) : 0;
-    const u = fortiNamed[4] || '0';
-    return `ge-0/0/${basePort + idx}.${u}`;
-  }
-
-  // Cisco: Tunnel interfaces → st0.N
-  const tunnelMatch = panosIface.match(/^tunnel(\d+)(\.(\d+))?$/i);
-  if (tunnelMatch) {
-    const u = tunnelMatch[1] || '0';
-    return `st0.${u}`;
-  }
-
-  // Bug 1 fix: Map vendor "loopback" interfaces to SRX lo0 naming.
-  // Vendor configs use "loopback.X" but SRX expects "lo0.X". Without this,
-  // the zone references an undefined interface-range 'loopback.X'.
-  const loMatch = panosIface.match(/^loopback(\.(\d+))?$/i);
-  if (loMatch) {
-    const u = loMatch[2] || '0';
-    return `lo0.${u}`;
-  }
-
-  // If it doesn't match any known format, return as-is
-  return panosIface;
 }
 
 /**
@@ -624,10 +522,15 @@ function emitInterfaceAddress(commands, warnings, base, unit, ifKey, family, raw
     `Assign the interface ${label} address manually on the SRX`));
 }
 
+/** True when the interface has a static IPv4/IPv6 address or a DHCP client. */
+function hasInterfaceAddressing(iface) {
+  return Boolean(iface.ip || iface.ipv6 || iface.mode === 'dhcp');
+}
+
 function convertInterfaceAddresses(interfaces, commands, warnings, summary, interfaceMappings = {}) {
   if (!interfaces || interfaces.length === 0) return;
 
-  const hasAddresses = interfaces.some(i => i.ip || i.ipv6);
+  const hasAddresses = interfaces.some(hasInterfaceAddressing);
   if (!hasAddresses) return;
 
   commands.push('# =============================================');
@@ -639,7 +542,7 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
   const vlanByBase = new Map();       // base -> Map(unit -> tag)
   const baseHasNativeIp = new Map();  // base -> true when a unit-0 iface has an IP and no tag
   for (const iface of interfaces) {
-    if (!iface.ip && !iface.ipv6) continue;
+    if (!hasInterfaceAddressing(iface)) continue;
     const [base, unit = '0'] = mapInterfaceName(iface.name || '', interfaceMappings).split('.');
     const tag = iface.vlan ? String(iface.vlan) : '';
     if (tag) {
@@ -665,7 +568,7 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
 
   const configuredInterfaces = new Set();
   for (const iface of interfaces) {
-    if (!iface.ip && !iface.ipv6) continue;
+    if (!hasInterfaceAddressing(iface)) continue;
 
     const srxName = mapInterfaceName(iface.name || '', interfaceMappings);
     const [base, unit = '0'] = srxName.split('.');
@@ -684,7 +587,11 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
       commands.push(`set interfaces ${base} unit ${unit} vlan-id ${String(iface.vlan)}`);
     }
 
-    emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet', iface.ip);
+    if (iface.mode === 'dhcp') {
+      commands.push(`set interfaces ${base} unit ${unit} family inet dhcp`);
+    } else {
+      emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet', iface.ip);
+    }
     emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet6', iface.ipv6);
     if (iface.description) {
       commands.push(`set interfaces ${base} unit ${unit} description ${setQuoted(iface.description, 'interfaces.description')}`);
@@ -795,24 +702,17 @@ function ensureZoneInterfaceFamilies(zones, interfaces, commands, interfaceMappi
  * @param {Object} summary - Summary counters
  * @param {Object} interfaceMappings - User-defined interface mappings
  */
-function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interfaceMappings = {}) {
+function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interfaceMappings = {}, emitDeviceCount = true) {
   if (!lagInterfaces || lagInterfaces.length === 0) return;
 
   commands.push('# =============================================');
   commands.push('# LAG / Aggregate Ethernet Interfaces');
   commands.push('# =============================================');
 
-  // Device count must accommodate the highest ae index
-  let maxAeIndex = 0;
-  for (const lag of lagInterfaces) {
-    const aeMatch = lag.name.match(/^ae(\d+)$/);
-    if (aeMatch) {
-      const idx = parseInt(aeMatch[1], 10);
-      if (idx >= maxAeIndex) maxAeIndex = idx + 1;
-    }
+  // Chassis config is root-level: the wrapping step leaves it unwrapped, and merged output emits it once.
+  if (emitDeviceCount) {
+    commands.push(`set chassis aggregated-devices ethernet device-count ${lagDeviceCount(lagInterfaces)}`);
   }
-
-  commands.push(`set chassis aggregated-devices ethernet device-count ${maxAeIndex}`);
 
   for (const lag of lagInterfaces) {
     const aeName = lag.name;
@@ -833,10 +733,8 @@ function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interf
     }
 
     // Member interface bindings
-    for (const member of lag.members) {
-      // Apply interface mapping if available
-      const mappedMember = mapInterfaceName(member, interfaceMappings);
-      const memberBase = mappedMember.split('.')[0];
+    for (let memberIndex = 0; memberIndex < lag.members.length; memberIndex += 1) {
+      const memberBase = resolveLagMemberPort(lag, memberIndex, interfaceMappings);
       commands.push(`set interfaces ${memberBase} ether-options 802.3ad ${aeName}`);
     }
 
@@ -1119,7 +1017,7 @@ function convertServiceObjects(services, commands, warnings, summary, identifier
 // Service Group Converter → SRX Application Sets
 // ---------------------------------------------------------------------------
 
-function convertServiceGroups(groups, commands, warnings, summary, sourceVendor = '', identifiers, identifierPath) {
+function convertServiceGroups(groups, commands, warnings, summary, sourceVendor = '', identifiers, identifierPath, unresolvedGroups = new Set()) {
   if (!groups || groups.length === 0) return;
 
   commands.push('# =============================================');
@@ -1144,6 +1042,16 @@ function convertServiceGroups(groups, commands, warnings, summary, sourceVendor 
       }
     }
 
+    if (unresolvedGroups.has(group.name)) {
+      commands.push(`# CAVEAT: application-set deactivated — member(s) are undefined services`);
+      commands.push(`deactivate applications application-set ${groupName}`);
+      warnings.push(createWarning(
+        'warning',
+        `service-group/${group.name}`,
+        `Service group "${group.name}" has undefined member(s) — application-set deactivated`,
+        'Define the missing services, then activate the application-set and the policies that use it',
+      ));
+    }
     summary.services_converted++;
   }
 
@@ -2201,6 +2109,7 @@ function prepareApplicationGroupApplications(groups, warnings, sourceVendor, ide
  */
 function resolveApplications(applications, services, warnings, policyName, appGroups = [], sourceVendor = '', policyIndex, identifiers, identifierPath) {
   const resolved = [];
+  const servicesRestrict = hasSpecificService(services);
 
   // Helper to map a single app name to Junos using three-tier emission logic
   const mapSingleApp = (appName, localReferencePath) => {
@@ -2220,6 +2129,7 @@ function resolveApplications(applications, services, warnings, policyName, appGr
     for (let appIndex = 0; appIndex < applications.length; appIndex += 1) {
       const app = applications[appIndex];
       if (app === 'any') {
+        if (servicesRestrict) continue;
         resolved.push(identifiers.nameForReference(
           identifierPath(`security_policies[${policyIndex}].applications[${appIndex}]`),
         ));
@@ -2362,12 +2272,23 @@ function convertNatRules(
       commands.push(...matchLines(rulePath, 'source-address', rule.match.source));
       commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
       if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
-      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${portText(rule.match.destinationPort)}`);
+      for (const port of rule.match.destinationPorts) commands.push(`set ${rulePath} match destination-port ${portText(port)}`);
       rule.thenComments.forEach(comment);
       const persistent = rule.persistent ? ' persistent-nat permit target-host' : '';
       if (rule.then.kind === 'pool') {
         for (const address of rule.then.pool.addresses) {
           commands.push(`set security nat source pool ${rule.then.pool.name} address ${address.prefix}${address.to ? ` to ${address.to}` : ''}`);
+        }
+        if (rule.then.pool.hostAddressBase) commands.push(`set security nat source pool ${rule.then.pool.name} host-address-base ${rule.then.pool.hostAddressBase}`);
+        if (rule.then.pool.noPortTranslation) commands.push(`set security nat source pool ${rule.then.pool.name} port no-translation`);
+        if (rule.then.pool.deterministic) commands.push(`set security nat source pool ${rule.then.pool.name} port deterministic host address ${rule.then.pool.deterministic.hostAddress}`);
+        if (rule.then.pool.blockAllocation) {
+          const { blockSize, maximumBlocksPerHost } = rule.then.pool.blockAllocation;
+          const blockPath = `set security nat source pool ${rule.then.pool.name} port block-allocation`;
+          // One command per leaf; a bare block-allocation when neither is set.
+          if (!blockSize && !maximumBlocksPerHost) commands.push(blockPath);
+          if (blockSize) commands.push(`${blockPath} block-size ${blockSize}`);
+          if (maximumBlocksPerHost) commands.push(`${blockPath} maximum-blocks-per-host ${maximumBlocksPerHost}`);
         }
         commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}${persistent}`);
       } else if (rule.then.kind === 'off') {
@@ -2386,6 +2307,7 @@ function convertNatRules(
     }
     const ruleSetPath = `security nat destination rule-set ${ruleSet.name}`;
     for (const zone of ruleSet.fromZones) commands.push(`set ${ruleSetPath} from zone ${zone}`);
+    for (const ifl of ruleSet.fromInterfaces) commands.push(`set ${ruleSetPath} from interface ${ifl}`);
     ruleSet.comments.forEach(comment);
     for (const rule of ruleSet.rules) {
       rule.comments.forEach(comment);
@@ -2407,6 +2329,12 @@ function convertNatRules(
   if (plan.static) {
     commands.push('# Static NAT Rules');
     for (const ruleSet of plan.static) {
+      // A from with no rule under it is not valid Junos, so a fully skipped rule-set keeps only its comments.
+      const emitsRules = !ruleSet.skipped && ruleSet.rules.some(rule => !rule.skipped);
+      if (ruleSet.skipped) ruleSet.comments.forEach(comment);
+      if (emitsRules) {
+        for (const zone of ruleSet.fromZones) commands.push(`set security nat static rule-set ${ruleSet.name} from zone ${zone}`);
+      }
       for (const rule of ruleSet.rules) {
         rule.comments.forEach(comment);
         if (rule.skipped) continue;
@@ -5033,6 +4961,25 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
     allCommands.push('');
   }
 
+  // Chassis aggregated-devices is root-level: emit it once for every slot's aggregates.
+  const mergedLags = configSlots.flatMap(slot => resolveLagInterfaces(slot.intermediateConfig, slot.interfaceMappings || {}).lagInterfaces);
+  if (mergedLags.length > 0) {
+    allCommands.push(`set chassis aggregated-devices ethernet device-count ${lagDeviceCount(mergedLags)}`);
+  }
+
+  // System services are root-level: enable the union once for all logical systems.
+  const mergedServiceLines = managementServiceSetLines(
+    deriveManagementServices(
+      configSlots.map(slot => slot.intermediateConfig),
+      allWarnings,
+      configSlots.map(slot => slot.lsName),
+    ),
+  );
+  if (mergedServiceLines.length > 0) {
+    for (const line of mergedServiceLines) allCommands.push(`set system services ${line}`);
+    allCommands.push('');
+  }
+
   // 2. Per-LS sections
   for (let slotIndex = 0; slotIndex < configSlots.length; slotIndex += 1) {
     const slot = configSlots[slotIndex];
@@ -5046,9 +4993,11 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
     // Use existing converter with targetContext set to logical-system
     const targetContext = { type: 'logical-system', name: lsName };
     const result = convertToSrxSetCommands(config, interfaceMappings, targetContext, {
+      skipSystemServices: true,
       identifierPlan: identifiers,
       pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
       targetContextPath: `configSlots[${slotIndex}].lsName`,
+      skipLagChassis: true,
     });
 
     allCommands.push(...result.commands);

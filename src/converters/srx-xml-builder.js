@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -20,7 +20,8 @@ import {
   xmlElementName,
   xmlText,
 } from '../security/junos-serialization.js';
-import { findNegationIssues, findPolicyReferenceIssues } from '../security/policy-reference-integrity.js';
+import { findNegationIssues, findPolicyReferenceIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
+import { resolveLagInterfaces, lagDeviceCount, resolveLagMemberPort } from './srx-lag-mapping.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 import {
@@ -30,6 +31,12 @@ import {
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateXmlOutput } from '../security/junos-output-validation.js';
 import { versionStamp } from '../version.js';
+import {
+  deriveManagementServices,
+  hostInboundEntries,
+  managementServiceXmlElements,
+  warnZonesWithoutHostInbound,
+} from './srx-host-inbound.js';
 import { planNat } from './nat-plan.js';
 
 /**
@@ -64,7 +71,9 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
       entry.definitionPath?.startsWith(`${identifierPath(localPath)}#generated:`)
     )),
   };
-  const warnings = [...identifiers.warnings];
+  const lagResolution = resolveLagInterfaces(config, interfaceMappings);
+  interfaceMappings = lagResolution.interfaceMappings;
+  const warnings = [...identifiers.warnings, ...lagResolution.warnings];
   const summary = {
     identifier_collisions_resolved: identifiers.collisionCount,
   };
@@ -114,6 +123,15 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
     }
   }
 
+  // Chassis config is root-level: never inside a logical-system/tenant, and merged output emits it once.
+  if (!options.skipLagChassis) buildLagChassisXml(lagResolution.lagInterfaces, lines, '  ');
+
+  // system services is root-level, so it goes before any logical-system/tenant wrapper.
+  // Merged output derives it once for all slots.
+  const managementServices = options.skipSystemServices ? {} : deriveManagementServices([config], warnings);
+  const serviceElements = managementServiceXmlElements(managementServices);
+  if (useContext && serviceElements.length > 0) buildSystemServicesXml(serviceElements, lines, '  ');
+
   // Open logical-system or tenant wrapper
   if (useContext) {
     const ctxTag = xmlElementName(
@@ -126,16 +144,16 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   }
 
   // System configuration (Day-0)
-  buildSystemConfigXml(config.system_config, lines, indent);
+  buildSystemConfigXml(config.system_config, lines, indent, useContext ? [] : serviceElements);
 
   // Interface addresses (IPv4 + IPv6)
-  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent);
+  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent, lagResolution.lagInterfaces);
 
   // Security section
   lines.push(`${indent}<security>`);
 
   // Zones
-  buildZonesXml(config.zones, lines, interfaceMappings, identifierNames);
+  buildZonesXml(config.zones, lines, interfaceMappings, identifierNames, warnings);
 
   // Address book
   buildAddressBookXml(config.address_objects, config.address_groups, lines, identifierNames);
@@ -194,7 +212,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildFlowMonitoringXml(config.flow_monitoring_config, lines, identifierNames);
 
   // Applications (includes Customfwic placeholders for unmapped apps)
-  buildApplicationsXml(config.service_objects, config.applications, config.service_groups, lines, xmlCustomfwicApps, identifierNames);
+  buildApplicationsXml(config.service_objects, config.applications, config.service_groups, lines, xmlCustomfwicApps, identifierNames, findUnresolvedServiceGroups(config), warnings);
 
   // Schedulers
   buildSchedulersXml(config.schedules, lines, identifierNames);
@@ -255,7 +273,24 @@ function mapZoneInterfaceName(iface, interfaceMappings = {}) {
   return iface;
 }
 
-function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
+function hostInboundXml(access, element, warnings, pad) {
+  const { services, protocols } = hostInboundEntries(access, element, warnings);
+  if (services.length === 0 && protocols.length === 0) return [];
+  const entry = (tag, { name, except }) => [
+    `${pad}  <${tag}>`,
+    `${pad}    <name>${xmlText(name)}</name>`,
+    ...(except ? [`${pad}    <except/>`] : []),
+    `${pad}  </${tag}>`,
+  ];
+  return [
+    `${pad}<host-inbound-traffic>`,
+    ...services.flatMap(item => entry('system-services', item)),
+    ...protocols.flatMap(item => entry('protocols', item)),
+    `${pad}</host-inbound-traffic>`,
+  ];
+}
+
+function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames, warnings = []) {
   if (!zones || zones.length === 0) return;
 
   lines.push('    <zones>');
@@ -268,14 +303,17 @@ function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
     if (zone.description) {
       lines.push(`        <description>${xmlText(zone.description)}</description>`);
     }
+    lines.push(...hostInboundXml(zone.host_inbound_traffic, `zones/${name}`, warnings, '        '));
     for (const iface of zone.interfaces || []) {
       const srxIface = mapZoneInterfaceName(iface, interfaceMappings);
       lines.push(`        <interfaces>`);
       lines.push(`          <name>${xmlText(srxIface)}</name>`);
+      lines.push(...hostInboundXml(zone.interface_host_inbound_traffic?.[iface], `zones/${name}/${srxIface}`, warnings, '          '));
       lines.push(`        </interfaces>`);
     }
     lines.push(`      </security-zone>`);
   }
+  warnZonesWithoutHostInbound(zones, warnings);
   lines.push('    </zones>');
 }
 
@@ -636,6 +674,13 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
     lines.push(pair.isGlobal ? '      </global>' : '      </policy>');
   }
 
+  // Fail closed when a global catch-all is removed or the config is merged onto a permit-all device; matches the set output.
+  if ([...zonePairs.values()].some(pair => pair.isGlobal)) {
+    lines.push('      <default-policy>');
+    lines.push('        <deny-all/>');
+    lines.push('      </default-policy>');
+  }
+
   lines.push('    </policies>');
 }
 
@@ -683,6 +728,9 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
     lines.push(`${indent}<rule-set>`);
     lines.push(`${indent}  <name>${xmlText(ruleSet.name)}</name>`);
     if (ruleSet.fromZones.length > 0) lines.push(`${indent}  ${zoneElements('from', ruleSet.fromZones)}`);
+    if (ruleSet.fromInterfaces?.length > 0) {
+      lines.push(`${indent}  <from>${ruleSet.fromInterfaces.map(ifl => `<interface>${xmlText(ifl)}</interface>`).join('')}</from>`);
+    }
     if (ruleSet.toZones.length > 0) lines.push(`${indent}  ${zoneElements('to', ruleSet.toZones)}`);
   };
   const poolsOf = ruleSets => {
@@ -722,7 +770,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
         matchElements('              ', 'source-address', rule.match.source);
         matchElements('              ', 'destination-address', rule.match.destination);
         if (rule.match.protocol) lines.push(`              <protocol>${xmlText(rule.match.protocol)}</protocol>`);
-        if (rule.match.destinationPort) lines.push(portElement('              ', rule.match.destinationPort));
+        for (const port of rule.match.destinationPorts) lines.push(portElement('              ', port));
         lines.push('            </src-nat-rule-match>');
         comments('            ', rule.thenComments);
         lines.push('            <then>');
@@ -746,6 +794,14 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
         lines.push(address.to
           ? `          <address><name>${xmlText(address.prefix)}</name><to><ipaddr>${xmlText(address.to)}</ipaddr></to></address>`
           : `          <address><name>${xmlText(address.prefix)}</name></address>`);
+      }
+      if (pool.hostAddressBase) lines.push(`          <host-address-base>${xmlText(pool.hostAddressBase)}</host-address-base>`);
+      if (pool.noPortTranslation) lines.push('          <port><no-translation/></port>');
+      if (pool.deterministic) lines.push(`          <port><deterministic><host><address>${xmlText(pool.deterministic.hostAddress)}</address></host></deterministic></port>`);
+      if (pool.blockAllocation) {
+        const { blockSize, maximumBlocksPerHost } = pool.blockAllocation;
+        const children = `${blockSize ? `<block-size>${xmlText(blockSize)}</block-size>` : ''}${maximumBlocksPerHost ? `<maximum-blocks-per-host>${xmlText(maximumBlocksPerHost)}</maximum-blocks-per-host>` : ''}`;
+        lines.push(`          <port><block-allocation${children ? `>${children}</block-allocation>` : '/>'}</port>`);
       }
       lines.push('        </pool>');
     }
@@ -789,14 +845,15 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
     lines.push('      </destination>');
   }
 
-  if (plan.static && !plan.static.some(ruleSet => ruleSet.rules.some(rule => !rule.skipped))) {
-    // Every static rule was skipped: an empty rule-set is not valid Junos, so keep only the comments.
-    for (const ruleSet of plan.static) {
-      for (const rule of ruleSet.rules) comments('      ', rule.comments);
-    }
-  } else if (plan.static) {
+  // A rule-set with no emitted rule is not valid Junos, so it keeps only its comments.
+  const emittedStatic = (plan.static || []).filter(ruleSet => !ruleSet.skipped && ruleSet.rules.some(rule => !rule.skipped));
+  for (const ruleSet of (plan.static || []).filter(item => !emittedStatic.includes(item))) {
+    comments('      ', ruleSet.comments);
+    for (const rule of ruleSet.rules) comments('      ', rule.comments);
+  }
+  if (emittedStatic.length > 0) {
     lines.push('      <static>');
-    for (const ruleSet of plan.static) {
+    for (const ruleSet of emittedStatic) {
       ruleSetHeader('        ', ruleSet);
       for (const rule of ruleSet.rules) {
         comments('          ', rule.comments);
@@ -842,7 +899,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
 // Applications XML Builder
 // ---------------------------------------------------------------------------
 
-function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines, customfwicMap, identifierNames) {
+function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines, customfwicMap, identifierNames, unresolvedSvcGroups = new Set(), warnings = []) {
   const allApps = [
     ...(serviceObjects || []).map((app, index) => ({ app, index, root: 'service_objects', kind: 'service', portField: 'port_range' })),
     ...(applications || []).map((app, index) => ({ app, index, root: 'applications', kind: 'application', portField: 'port' })),
@@ -937,7 +994,15 @@ function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
     const group = groups[groupIndex];
     const groupName = identifierNames.definition(`service_groups[${groupIndex}].name`);
-    lines.push('    <application-set>');
+    if (unresolvedSvcGroups.has(group.name)) {
+      warnings.push(createWarning(
+        'warning',
+        `service-group/${group.name}`,
+        `Service group "${group.name}" has undefined member(s) — application-set deactivated`,
+        'Define the missing services, then activate the application-set and the policies that use it',
+      ));
+    }
+    lines.push(unresolvedSvcGroups.has(group.name) ? '    <application-set inactive="inactive">' : '    <application-set>');
     lines.push(`      <name>${xmlText(groupName)}</name>`);
     for (let memberIndex = 0; memberIndex < group.members.length; memberIndex += 1) {
       const member = group.members[memberIndex];
@@ -1433,6 +1498,7 @@ function prepareXmlApplicationGroupApplications(groups, identifierNames) {
 
 function resolveApps(applications, services, warnings, policyName, appGroups = [], sourceVendor = '', policyIndex, identifierNames) {
   const resolved = [];
+  const servicesRestrict = hasSpecificService(services);
   const isSrxSource = sourceVendor === 'srx' || sourceVendor === 'greenfield' || sourceVendor === 'srx_healthcheck';
 
   // Helper to map a single app name to Junos (with Customfwic fallback)
@@ -1463,6 +1529,7 @@ function resolveApps(applications, services, warnings, policyName, appGroups = [
     for (let appIndex = 0; appIndex < applications.length; appIndex += 1) {
       const app = applications[appIndex];
       if (app === 'any') {
+        if (servicesRestrict) continue;
         resolved.push(identifierNames.reference(`security_policies[${policyIndex}].applications[${appIndex}]`));
         continue;
       }
@@ -3235,11 +3302,37 @@ function buildFlowMonitoringXml(flowConfig, lines, identifierNames) {
 // System Configuration (Day-0)
 // ---------------------------------------------------------------------------
 
-function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ') {
-  if (!interfaces || interfaces.length === 0) return;
+/** Mirrors the set converter: chassis aggregated-devices ethernet device-count = highest aeN + 1. */
+function buildLagChassisXml(lagInterfaces, lines, indent = '  ') {
+  if (!lagInterfaces || lagInterfaces.length === 0) return;
+  const deviceCount = lagDeviceCount(lagInterfaces);
+  lines.push(`${indent}<chassis><aggregated-devices><ethernet><device-count>${deviceCount}</device-count></ethernet></aggregated-devices></chassis>`);
+}
 
-  const withAddrs = interfaces.filter(i => i.ip || i.ipv6);
-  if (withAddrs.length === 0) return;
+/** One <interface> per ae (LACP, description) and per member port (bundle binding). */
+function buildLagInterfacesXml(lagInterfaces, lines, interfaceMappings, indent) {
+  for (const lag of lagInterfaces || []) {
+    lines.push(`${indent}  <interface>`);
+    lines.push(`${indent}    <name>${xmlText(lag.name)}</name>`);
+    if (lag.description) lines.push(`${indent}    <description>${xmlText(lag.description)}</description>`);
+    const lacp = [];
+    if (lag.lacp_mode === 'active' || lag.lacp_mode === 'passive') lacp.push(`<${lag.lacp_mode}/>`);
+    if (lag.lacp_priority) lacp.push(`<system-priority>${xmlText(String(lag.lacp_priority))}</system-priority>`);
+    if (lacp.length > 0) lines.push(`${indent}    <aggregated-ether-options><lacp>${lacp.join('')}</lacp></aggregated-ether-options>`);
+    lines.push(`${indent}  </interface>`);
+    for (let memberIndex = 0; memberIndex < lag.members.length; memberIndex += 1) {
+      const memberBase = resolveLagMemberPort(lag, memberIndex, interfaceMappings);
+      lines.push(`${indent}  <interface>`);
+      lines.push(`${indent}    <name>${xmlText(memberBase)}</name>`);
+      lines.push(`${indent}    <ether-options><ieee-802.3ad><bundle>${xmlText(lag.name)}</bundle></ieee-802.3ad></ether-options>`);
+      lines.push(`${indent}  </interface>`);
+    }
+  }
+}
+
+function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ', lagInterfaces = []) {
+  const withAddrs = (interfaces || []).filter(i => i.ip || i.ipv6 || i.mode === 'dhcp');
+  if (withAddrs.length === 0 && lagInterfaces.length === 0) return;
 
   lines.push(`${indent}<!-- Interface Addresses -->`);
   lines.push(`${indent}<interfaces>`);
@@ -3266,35 +3359,47 @@ function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, i
     if (iface.description) {
       lines.push(`${indent}      <description>${xmlText(iface.description)}</description>`);
     }
-    if (iface.ip) {
+    const inetBody = iface.mode === 'dhcp'
+      ? `${indent}          <dhcp/>`
+      : iface.ip ? `${indent}          <address><name>${xmlText(iface.ip)}</name></address>` : '';
+    if (inetBody || iface.ipv6) {
       lines.push(`${indent}      <family>`);
-      lines.push(`${indent}        <inet>`);
-      lines.push(`${indent}          <address><name>${xmlText(iface.ip)}</name></address>`);
-      lines.push(`${indent}        </inet>`);
+      if (inetBody) {
+        lines.push(`${indent}        <inet>`);
+        lines.push(inetBody);
+        lines.push(`${indent}        </inet>`);
+      }
       if (iface.ipv6) {
         lines.push(`${indent}        <inet6>`);
         lines.push(`${indent}          <address><name>${xmlText(iface.ipv6)}</name></address>`);
         lines.push(`${indent}        </inet6>`);
       }
       lines.push(`${indent}      </family>`);
-    } else if (iface.ipv6) {
-      lines.push(`${indent}      <family>`);
-      lines.push(`${indent}        <inet6>`);
-      lines.push(`${indent}          <address><name>${xmlText(iface.ipv6)}</name></address>`);
-      lines.push(`${indent}        </inet6>`);
-      lines.push(`${indent}      </family>`);
     }
     lines.push(`${indent}    </unit>`);
     lines.push(`${indent}  </interface>`);
   }
 
+  buildLagInterfacesXml(lagInterfaces, lines, interfaceMappings, indent);
   lines.push(`${indent}</interfaces>`);
 }
 
-function buildSystemConfigXml(systemConfig, lines, indent = '  ') {
-  if (!systemConfig) return;
+function pushServicesXml(serviceElements, lines, indent) {
+  lines.push(`${indent}<services>`);
+  for (const element of serviceElements) lines.push(`${indent}  ${element}`);
+  lines.push(`${indent}</services>`);
+}
 
-  const hasContent = systemConfig.hostname || systemConfig.domain_name ||
+function buildSystemServicesXml(serviceElements, lines, indent) {
+  lines.push(`${indent}<system>`);
+  pushServicesXml(serviceElements, lines, `${indent}  `);
+  lines.push(`${indent}</system>`);
+}
+
+function buildSystemConfigXml(systemConfig, lines, indent = '  ', serviceElements = []) {
+  systemConfig = systemConfig || {};
+
+  const hasContent = serviceElements.length > 0 || systemConfig.hostname || systemConfig.domain_name ||
     (systemConfig.dns_servers && systemConfig.dns_servers.length > 0) ||
     (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) ||
     systemConfig.timezone || systemConfig.login_banner;
@@ -3322,20 +3427,7 @@ function buildSystemConfigXml(systemConfig, lines, indent = '  ') {
     lines.push(`${indent}  </login>`);
   }
 
-  const mgmt = systemConfig.management_services || {};
-  if (mgmt.ssh || mgmt.https || mgmt.netconf) {
-    lines.push(`${indent}  <services>`);
-    if (mgmt.ssh) lines.push(`${indent}    <ssh/>`);
-    if (mgmt.https) {
-      lines.push(`${indent}    <web-management>`);
-      lines.push(`${indent}      <https><system-generated-certificate/></https>`);
-      lines.push(`${indent}    </web-management>`);
-    }
-    if (mgmt.netconf) {
-      lines.push(`${indent}    <netconf><ssh/></netconf>`);
-    }
-    lines.push(`${indent}  </services>`);
-  }
+  if (serviceElements.length > 0) pushServicesXml(serviceElements, lines, `${indent}  `);
 
   if (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) {
     lines.push(`${indent}  <ntp>`);
@@ -3404,9 +3496,21 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
   ));
 
   buildHaXml(globalConfig.ha_config, allLines);
+  const mergedLags = configSlots.flatMap(slot => resolveLagInterfaces(slot.intermediateConfig, slot.interfaceMappings || {}).lagInterfaces);
+  buildLagChassisXml(mergedLags, allLines, '  ');
   buildSyslogXml(globalConfig.syslog_config, allLines);
   buildSnmpXml(globalConfig.snmp_config, allLines, globalIdentifierNames);
   buildAaaXml(globalConfig.aaa_config, allLines, globalIdentifierNames);
+
+  // System services are root-level: enable the union once for all logical systems.
+  const mergedServiceElements = managementServiceXmlElements(
+    deriveManagementServices(
+      configSlots.map(slot => slot.intermediateConfig),
+      allWarnings,
+      configSlots.map(slot => slot.lsName),
+    ),
+  );
+  if (mergedServiceElements.length > 0) buildSystemServicesXml(mergedServiceElements, allLines, '  ');
 
   // Per-LS sections
   for (let slotIndex = 0; slotIndex < configSlots.length; slotIndex += 1) {
@@ -3419,6 +3523,8 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
       ctx,
       {
         omitConfigurationWrapper: true,
+        skipLagChassis: true,
+        skipSystemServices: true,
         identifierPlan: identifiers,
         pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
         targetContextPath: `configSlots[${slotIndex}].lsName`,
